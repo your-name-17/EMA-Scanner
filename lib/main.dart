@@ -49,7 +49,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   int klinesLimit = 120;
   int workers = 8;
 
-  static const int _continuousDelaySeconds = 5;
+  static const Duration _fallbackContinuousDelay = Duration(seconds: 5);
+  static const Duration _scanAlignSafetyBuffer = Duration(seconds: 1);
 
   final List<_ScanTask> _tasks = <_ScanTask>[];
 
@@ -293,6 +294,84 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     }
   }
 
+  Duration? _intervalToDuration(String value) {
+    final match = RegExp(r'^(\d+)([mhdw])$').firstMatch(value);
+    if (match == null) return null;
+
+    final amount = int.tryParse(match.group(1) ?? '');
+    final unit = match.group(2);
+    if (amount == null || amount <= 0 || unit == null) return null;
+
+    switch (unit) {
+      case 'm':
+        return Duration(minutes: amount);
+      case 'h':
+        return Duration(hours: amount);
+      case 'd':
+        return Duration(days: amount);
+      case 'w':
+        return Duration(days: amount * 7);
+      default:
+        return null;
+    }
+  }
+
+  DateTime _nextBoundaryUtc(DateTime nowUtc, Duration interval) {
+    final intervalMs = interval.inMilliseconds;
+    final nowMs = nowUtc.millisecondsSinceEpoch;
+    final nextMs = ((nowMs ~/ intervalMs) + 1) * intervalMs;
+    return DateTime.fromMillisecondsSinceEpoch(nextMs, isUtc: true);
+  }
+
+  Future<DateTime> _getExchangeNowUtc() async {
+    try {
+      final data =
+          await httpGetJson('$binanceFapiBase/fapi/v1/time') as dynamic;
+      if (data is Map<String, dynamic>) {
+        final serverTimeMs = data['serverTime'];
+        if (serverTimeMs is int) {
+          return DateTime.fromMillisecondsSinceEpoch(serverTimeMs, isUtc: true);
+        }
+        if (serverTimeMs is String) {
+          final parsed = int.tryParse(serverTimeMs);
+          if (parsed != null) {
+            return DateTime.fromMillisecondsSinceEpoch(parsed, isUtc: true);
+          }
+        }
+      }
+    } catch (e) {
+      _log('获取 Binance 服务器时间失败，回退本地时间: $e');
+    }
+    return DateTime.now().toUtc();
+  }
+
+  Future<void> _waitUntilNextKlineClose(_ScanTask task) async {
+    final intervalDuration = _intervalToDuration(task.interval);
+    if (intervalDuration == null) {
+      _log('任务 #${task.id} 周期 ${task.interval} 无法解析，使用兜底等待 5 秒');
+      await Future.delayed(_fallbackContinuousDelay);
+      return;
+    }
+
+    final nowUtc = await _getExchangeNowUtc();
+    final nextCloseUtc = _nextBoundaryUtc(nowUtc, intervalDuration);
+    var remaining = nextCloseUtc.difference(nowUtc) + _scanAlignSafetyBuffer;
+    if (remaining <= Duration.zero) {
+      remaining = const Duration(milliseconds: 500);
+    }
+
+    _log(
+      '任务 #${task.id} 等待至下一根 ${task.interval} K线收线后再扫描（约 ${remaining.inSeconds}s）',
+    );
+
+    const tick = Duration(seconds: 1);
+    while (!task.cancelRequested && remaining > Duration.zero) {
+      final step = remaining > tick ? tick : remaining;
+      await Future.delayed(step);
+      remaining -= step;
+    }
+  }
+
   Future<void> _runScanForTask(_ScanTask task) async {
     if (task.isRunning) return;
 
@@ -354,9 +433,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
             break;
           }
 
-          await Future.delayed(
-            const Duration(seconds: _continuousDelaySeconds),
-          );
+          await _waitUntilNextKlineClose(task);
           continue;
         }
 
@@ -524,8 +601,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           break;
         }
 
-        _log('任务 #${task.id} 持续扫描已开启，等待下一轮扫描...');
-        await Future.delayed(const Duration(seconds: _continuousDelaySeconds));
+        _log('任务 #${task.id} 持续扫描已开启，等待当前未走完 K线收线...');
+        await _waitUntilNextKlineClose(task);
       }
     } catch (e) {
       setState(() {
