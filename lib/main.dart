@@ -7,8 +7,12 @@ import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'web_notifications/web_notification_service_stub.dart'
+    if (dart.library.html) 'web_notifications/web_notification_service_web.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
 }
 
@@ -35,17 +39,24 @@ class EmaScannerPage extends StatefulWidget {
   State<EmaScannerPage> createState() => _EmaScannerPageState();
 }
 
-class _EmaScannerPageState extends State<EmaScannerPage> {
-  bool _isLoading = false;
-  bool _cancelRequested = false;
+class _EmaScannerPageState extends State<EmaScannerPage>
+    with WidgetsBindingObserver {
   String _status = '';
-  List<MatchResult> _matches = [];
 
   String interval = '1d';
   int topN = 100;
   double threshold = 0.1;
   int klinesLimit = 120;
   int workers = 8;
+
+  static const int _continuousDelaySeconds = 5;
+
+  final List<_ScanTask> _tasks = <_ScanTask>[];
+
+  final FlutterLocalNotificationsPlugin _notifications =
+      FlutterLocalNotificationsPlugin();
+
+  bool _isAppResumed = true;
 
   late TextEditingController _topNController;
   late TextEditingController _thresholdController;
@@ -59,6 +70,7 @@ class _EmaScannerPageState extends State<EmaScannerPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _topNController = TextEditingController(text: topN.toString());
     _thresholdController = TextEditingController(
       text: threshold.toStringAsFixed(2),
@@ -67,6 +79,8 @@ class _EmaScannerPageState extends State<EmaScannerPage> {
       text: klinesLimit.toString(),
     );
     _workersController = TextEditingController(text: workers.toString());
+
+    _initNotifications();
   }
 
   @override
@@ -75,196 +89,453 @@ class _EmaScannerPageState extends State<EmaScannerPage> {
     _thresholdController.dispose();
     _klinesLimitController.dispose();
     _workersController.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
-  void _stopScan() {
-    if (!_isLoading) return;
-    setState(() {
-      _cancelRequested = true;
-      _status = '已请求终止扫描...';
-    });
-    _log('收到终止扫描请求');
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _isAppResumed = state == AppLifecycleState.resumed;
+  }
+
+  Future<void> _initNotifications() async {
+    if (kIsWeb) {
+      await initWebNotifications();
+      return;
+    }
+
+    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const windowsInit = WindowsInitializationSettings(
+      appName: 'Binance EMA Scanner',
+      appUserModelId: 'dev.trading.ema_scanner',
+      guid: 'd49b0314-ee7a-4626-bf79-97cdb8a991bb',
+    );
+
+    const initSettings = InitializationSettings(
+      android: androidInit,
+      windows: windowsInit,
+    );
+
+    await _notifications.initialize(settings: initSettings);
+
+    if (Platform.isAndroid) {
+      final androidImpl = _notifications
+          .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin
+          >();
+      await androidImpl?.requestNotificationsPermission();
+    }
   }
 
   void _clearResults() {
     setState(() {
-      _matches = [];
-      _status = '';
+      for (final task in _tasks) {
+        task.matches.clear();
+        task.lastMatchedSymbols.clear();
+        task.status = '';
+        task.isRunning = false;
+        task.cancelRequested = false;
+      }
+      _status = '已清空所有任务结果';
     });
-    _log('已清空结果和状态');
+    _log('已清空所有任务结果');
   }
 
-  Future<void> _startScan() async {
-    if (_isLoading) return;
+  void _addTask() {
+    final parsedThreshold = double.tryParse(_thresholdController.text);
+    if (parsedThreshold == null || parsedThreshold <= 0) {
+      setState(() {
+        _status = '无法添加任务：threshold 不合法（需要 > 0）';
+      });
+      _log('添加任务失败：threshold 不合法，值=${_thresholdController.text}');
+      return;
+    }
+
+    threshold = parsedThreshold;
+    final int id = _tasks.isEmpty ? 1 : (_tasks.last.id + 1);
+    setState(() {
+      _tasks.add(
+        _ScanTask(id: id, interval: interval, threshold: parsedThreshold),
+      );
+      _status = '已添加任务 #$id (周期 $interval, threshold=$parsedThreshold)';
+    });
+    _log('已添加任务 #$id (周期 $interval, threshold=$parsedThreshold)');
+  }
+
+  void _stopTask(_ScanTask task) {
+    if (!task.isRunning) return;
+    setState(() {
+      task.cancelRequested = true;
+      task.status = '已请求终止扫描...';
+    });
+    _log('收到终止任务 #${task.id} (周期 ${task.interval}) 的请求');
+  }
+
+  void _deleteTask(_ScanTask task) {
+    setState(() {
+      if (task.isRunning) {
+        task.cancelRequested = true;
+        task.status = '删除中，已请求终止扫描...';
+      }
+      _tasks.remove(task);
+      _status = '已删除任务 #${task.id} (周期 ${task.interval})';
+    });
+    _log('已删除任务 #${task.id} (周期 ${task.interval})');
+  }
+
+  Future<void> _showMatchesDialog(
+    String taskInterval,
+    List<MatchResult> matches,
+  ) async {
+    if (!mounted || matches.isEmpty) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('周期 $taskInterval 发现 EMA 收敛币种'),
+          content: SizedBox(
+            width: 320,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: matches
+                    .map(
+                      (m) => Text(
+                        '${m.symbol}  spread=${m.spreadPct.toStringAsFixed(4)}%',
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showMatchesNotification(
+    String taskInterval,
+    List<MatchResult> matches,
+  ) async {
+    if (kIsWeb || matches.isEmpty) return;
+
+    const androidDetails = AndroidNotificationDetails(
+      'ema_scanner_channel',
+      'EMA 收敛提醒',
+      channelDescription: '当扫描到满足 EMA 收敛条件的币种时提醒',
+      importance: Importance.high,
+      priority: Priority.high,
+    );
+
+    const details = NotificationDetails(android: androidDetails);
+
+    final title = '周期 $taskInterval 发现 ${matches.length} 个 EMA 收敛币种';
+    final body = matches
+        .take(3)
+        .map((m) => '${m.symbol} (${m.spreadPct.toStringAsFixed(2)}%)')
+        .join(', ');
+
+    try {
+      await _notifications.show(
+        id: 0,
+        title: title,
+        body: body.isEmpty ? null : body,
+        notificationDetails: details,
+      );
+    } catch (e) {
+      _log('发送系统通知失败: $e');
+    }
+  }
+
+  Future<void> _notifyForTaskMatches(
+    _ScanTask task,
+    List<MatchResult> matches,
+  ) async {
+    if (!mounted || matches.isEmpty) return;
+
+    if (kIsWeb) {
+      final canNotify = await webCanNotify();
+      final title = '周期 ${task.interval} 发现 ${matches.length} 个 EMA 收敛币种';
+      final body = matches
+          .take(3)
+          .map((m) => '${m.symbol} (${m.spreadPct.toStringAsFixed(2)}%)')
+          .join(', ');
+
+      if (canNotify) {
+        await showWebNotification(title, body);
+      }
+
+      if (_isAppResumed || !canNotify) {
+        await _showMatchesDialog(task.interval, matches);
+      }
+      return;
+    }
+
+    final isDesktop =
+        !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
+
+    if (isDesktop) {
+      if (_isAppResumed) {
+        await _showMatchesDialog(task.interval, matches);
+      } else {
+        await _showMatchesNotification(task.interval, matches);
+      }
+    } else {
+      // 手机端统一使用系统通知，避免后台场景弹对话框失败。
+      await _showMatchesNotification(task.interval, matches);
+    }
+  }
+
+  Future<void> _runScanForTask(_ScanTask task) async {
+    if (task.isRunning) return;
 
     final parsedTopN = int.tryParse(_topNController.text);
-    final parsedThreshold = double.tryParse(_thresholdController.text);
     final parsedKlinesLimit = int.tryParse(_klinesLimitController.text);
     final parsedWorkers = int.tryParse(_workersController.text);
 
     if (parsedTopN == null ||
         parsedTopN <= 0 ||
-        parsedThreshold == null ||
-        parsedThreshold <= 0 ||
         parsedKlinesLimit == null ||
         parsedKlinesLimit < 100 ||
         parsedWorkers == null ||
         parsedWorkers <= 0) {
       setState(() {
         _status = '参数不合法，请检查 topN、threshold、klinesLimit（>=100）、workers（>0）';
+        task.status = '参数不合法，无法启动任务';
       });
       _log(
-        '参数不合法: topN=$parsedTopN threshold=$parsedThreshold klinesLimit=$parsedKlinesLimit workers=$parsedWorkers',
+        '任务 #${task.id} 参数不合法: topN=$parsedTopN klinesLimit=$parsedKlinesLimit workers=$parsedWorkers',
       );
       return;
     }
 
     topN = parsedTopN;
-    threshold = parsedThreshold;
     klinesLimit = parsedKlinesLimit;
     workers = parsedWorkers;
 
+    final taskThreshold = task.threshold;
+
     setState(() {
-      _isLoading = true;
-      _cancelRequested = false;
-      _status = '开始扫描...';
-      _matches = [];
+      task.isRunning = true;
+      task.cancelRequested = false;
+      task.status = '开始扫描...';
+      task.matches.clear();
+      task.lastMatchedSymbols.clear();
+      _status = '任务 #${task.id} (周期 ${task.interval}) 开始扫描';
     });
     _log(
-      '开始扫描: interval=$interval topN=$topN threshold=$threshold klinesLimit=$klinesLimit workers=$workers',
+      '任务 #${task.id} 开始扫描: interval=${task.interval} topN=$topN threshold=$taskThreshold klinesLimit=$klinesLimit workers=$workers 持续=${task.continuous}',
     );
 
     try {
-      final symbols = await fetchTopSymbolsByQuoteVolume(topN);
-      if (symbols.isEmpty) {
-        setState(() {
-          _status = '未获取到任何 symbol';
-        });
-        _log('未获取到任何 symbol');
-        return;
-      }
-
-      final matches = <MatchResult>[];
-      final total = symbols.length;
-      int idx = 0;
-
-      Future<MatchResult?> worker(int localIdx, String symbol) async {
-        if (_cancelRequested) {
-          return null;
-        }
-        try {
-          final closes = await fetchKlines(symbol, interval, klinesLimit);
-          final List<double> closedCloses = closes.length > 1
-              ? closes.sublist(0, closes.length - 1)
-              : [];
-
-          if (closedCloses.length < 100) {
-            if (!mounted) return null;
-            setState(() {
-              _status = '[$localIdx/$total] $symbol 跳过(数据不足)';
-            });
-            _log('[$localIdx/$total] $symbol 跳过(数据不足)');
-            return null;
-          }
-
-          final e7 = ema(closedCloses, 7);
-          final e25 = ema(closedCloses, 25);
-          final e99 = ema(closedCloses, 99);
-
-          if (e7 == null || e25 == null || e99 == null) {
-            if (!mounted) return null;
-            setState(() {
-              _status = '[$localIdx/$total] $symbol 跳过(EMA 计算失败)';
-            });
-            _log('[$localIdx/$total] $symbol 跳过(EMA 计算失败)');
-            return null;
-          }
-
-          final result = isEmaConverged(e7, e25, e99, threshold);
-          final spreadPct = result.spread * 100.0;
-
-          if (result.ok) {
-            final m = MatchResult(symbol: symbol, spreadPct: spreadPct);
-            if (!mounted) return m;
-            if (_cancelRequested) return null;
-            setState(() {
-              _status =
-                  '[$localIdx/$total] $symbol 发现匹配 spread=${spreadPct.toStringAsFixed(4)}%';
-              _matches = [...matches, m];
-            });
-            _log(
-              '[$localIdx/$total] $symbol 发现匹配 spread=${spreadPct.toStringAsFixed(4)}%',
-            );
-            return m;
-          } else {
-            if (!mounted) return null;
-            if (_cancelRequested) return null;
-            setState(() {
-              _status =
-                  '[$localIdx/$total] $symbol 不满足阈值 spread=${spreadPct.toStringAsFixed(4)}%';
-            });
-            _log(
-              '[$localIdx/$total] $symbol 不满足阈值 spread=${spreadPct.toStringAsFixed(4)}%',
-            );
-            return null;
-          }
-        } catch (e) {
-          if (!mounted) return null;
-          if (_cancelRequested) return null;
-          setState(() {
-            _status = '[$localIdx/$total] $symbol 失败($e)';
-          });
-          _log('[$localIdx/$total] $symbol 失败: $e');
-          return null;
-        }
-      }
-
-      var i = 0;
-      final batchSize = workers;
-      while (i < total) {
-        if (_cancelRequested) {
+      while (true) {
+        if (!mounted || task.cancelRequested) {
+          _log('检测到任务 #${task.id} 终止标志，结束扫描循环');
           break;
         }
-        final end = (i + batchSize) > total ? total : (i + batchSize);
-        final batch = symbols.sublist(i, end);
-        final futures = <Future<MatchResult?>>[];
-        for (final symbol in batch) {
-          idx += 1;
-          futures.add(worker(idx, symbol));
+
+        _log('任务 #${task.id} 开始新一轮扫描');
+        final symbols = await fetchTopSymbolsByQuoteVolume(topN);
+        if (symbols.isEmpty) {
+          setState(() {
+            task.status = '未获取到任何 symbol';
+            _status = '任务 #${task.id} (周期 ${task.interval}) 未获取到任何 symbol';
+          });
+          _log('任务 #${task.id} 未获取到任何 symbol');
+
+          if (!task.continuous) {
+            break;
+          }
+
+          await Future.delayed(
+            const Duration(seconds: _continuousDelaySeconds),
+          );
+          continue;
         }
-        final results = await Future.wait(futures);
-        for (final r in results) {
-          if (r != null) {
-            matches.add(r);
+
+        final matches = <MatchResult>[];
+        final total = symbols.length;
+        int idx = 0;
+
+        Future<MatchResult?> worker(int localIdx, String symbol) async {
+          if (task.cancelRequested) {
+            return null;
+          }
+          try {
+            final closes = await fetchKlines(
+              symbol,
+              task.interval,
+              klinesLimit,
+            );
+            final List<double> closedCloses = closes.length > 1
+                ? closes.sublist(0, closes.length - 1)
+                : [];
+
+            if (closedCloses.length < 100) {
+              if (!mounted) return null;
+              setState(() {
+                task.status = '[$localIdx/$total] $symbol 跳过(数据不足)';
+                _status =
+                    '任务 #${task.id} (周期 ${task.interval}) $symbol 跳过(数据不足) [$localIdx/$total]';
+              });
+              _log('任务 #${task.id} [$localIdx/$total] $symbol 跳过(数据不足)');
+              return null;
+            }
+
+            final e7 = ema(closedCloses, 7);
+            final e25 = ema(closedCloses, 25);
+            final e99 = ema(closedCloses, 99);
+
+            if (e7 == null || e25 == null || e99 == null) {
+              if (!mounted) return null;
+              setState(() {
+                task.status = '[$localIdx/$total] $symbol 跳过(EMA 计算失败)';
+                _status =
+                    '任务 #${task.id} (周期 ${task.interval}) $symbol 跳过(EMA 计算失败) [$localIdx/$total]';
+              });
+              _log('任务 #${task.id} [$localIdx/$total] $symbol 跳过(EMA 计算失败)');
+              return null;
+            }
+
+            final result = isEmaConverged(e7, e25, e99, taskThreshold);
+            final spreadPct = result.spread * 100.0;
+
+            if (result.ok) {
+              final m = MatchResult(symbol: symbol, spreadPct: spreadPct);
+              if (!mounted) return m;
+              if (task.cancelRequested) return null;
+              setState(() {
+                task.status =
+                    '[$localIdx/$total] $symbol 发现匹配 spread=${spreadPct.toStringAsFixed(4)}%';
+                _status =
+                    '任务 #${task.id} (周期 ${task.interval}) $symbol 发现匹配 spread=${spreadPct.toStringAsFixed(4)}% [$localIdx/$total]';
+                task.matches = [...task.matches, m];
+              });
+              _log(
+                '任务 #${task.id} [$localIdx/$total] $symbol 发现匹配 spread=${spreadPct.toStringAsFixed(4)}%',
+              );
+              return m;
+            } else {
+              if (!mounted) return null;
+              if (task.cancelRequested) return null;
+              setState(() {
+                task.status =
+                    '[$localIdx/$total] $symbol 不满足阈值 spread=${spreadPct.toStringAsFixed(4)}%';
+                _status =
+                    '任务 #${task.id} (周期 ${task.interval}) $symbol 不满足阈值 spread=${spreadPct.toStringAsFixed(4)}% [$localIdx/$total]';
+              });
+              _log(
+                '任务 #${task.id} [$localIdx/$total] $symbol 不满足阈值 spread=${spreadPct.toStringAsFixed(4)}%',
+              );
+              return null;
+            }
+          } catch (e) {
+            if (!mounted) return null;
+            if (task.cancelRequested) return null;
+            setState(() {
+              task.status = '[$localIdx/$total] $symbol 失败($e)';
+              _status =
+                  '任务 #${task.id} (周期 ${task.interval}) $symbol 失败($e) [$localIdx/$total]';
+            });
+            _log('任务 #${task.id} [$localIdx/$total] $symbol 失败: $e');
+            return null;
           }
         }
-        i = end;
-      }
 
-      if (_cancelRequested) {
-        setState(() {
-          _status = '扫描已终止，当前匹配数量: ${matches.length}';
-        });
-        _log('扫描被终止，匹配数量: ${matches.length}');
-      } else {
+        var i = 0;
+        final batchSize = workers;
+        while (i < total) {
+          if (task.cancelRequested) {
+            break;
+          }
+          final end = (i + batchSize) > total ? total : (i + batchSize);
+          final batch = symbols.sublist(i, end);
+          final futures = <Future<MatchResult?>>[];
+          for (final symbol in batch) {
+            idx += 1;
+            futures.add(worker(idx, symbol));
+          }
+          final results = await Future.wait(futures);
+          for (final r in results) {
+            if (r != null) {
+              matches.add(r);
+            }
+          }
+          i = end;
+        }
+
+        if (task.cancelRequested) {
+          setState(() {
+            task.status = '扫描已终止，当前匹配数量: ${matches.length}';
+            _status =
+                '任务 #${task.id} (周期 ${task.interval}) 扫描已终止，当前匹配数量: ${matches.length}';
+          });
+          _log('任务 #${task.id} 扫描被终止，匹配数量: ${matches.length}');
+          break;
+        }
+
+        // 本轮匹配的 symbol 集合，用于判断哪些是“本轮新加入队伍”的币种。
+        final currentSymbols = matches.map((m) => m.symbol).toSet();
+        // 与上一轮相比，新进入“符合条件队伍”的币种。
+        final newSymbols = currentSymbols.difference(task.lastMatchedSymbols);
+
         setState(() {
           if (matches.isEmpty) {
-            _status = '扫描完成，没有任何币种满足阈值条件。';
+            task.status = task.continuous
+                ? '本轮扫描完成，没有任何币种满足阈值条件（持续扫描已开启）。'
+                : '扫描完成，没有任何币种满足阈值条件。';
           } else {
-            _status = '扫描完成，共找到 ${matches.length} 个匹配币种。';
+            task.status = task.continuous
+                ? '本轮扫描完成，共找到 ${matches.length} 个匹配币种（持续扫描已开启）。'
+                : '扫描完成，共找到 ${matches.length} 个匹配币种。';
           }
+          _status = '任务 #${task.id} (周期 ${task.interval}) ${task.status}';
+          // 用本轮匹配结果覆盖任务的匹配列表，移除本轮不再符合的币种。
+          task.matches = List<MatchResult>.from(matches);
         });
-        _log('扫描完成，匹配数量: ${matches.length}');
+        _log('任务 #${task.id} 本轮扫描完成，匹配数量: ${matches.length}');
+
+        // 只对“本轮新进入符合条件队伍”的币种提醒；
+        // 对于中途消失又在本轮重新出现的币种，会再次被视为新成员并提醒。
+        final toNotify = matches
+            .where((m) => newSymbols.contains(m.symbol))
+            .toList(growable: false);
+
+        // 记录本轮的符合条件队伍，用于下一轮对比；
+        // 没有在本轮中出现的币种会从集合中移除，
+        // 以后若再次出现，将再次被视为“新出现”，重新提醒。
+        task.lastMatchedSymbols = currentSymbols;
+        if (toNotify.isNotEmpty) {
+          await _notifyForTaskMatches(task, toNotify);
+        }
+
+        if (!task.continuous) {
+          break;
+        }
+
+        if (task.cancelRequested) {
+          break;
+        }
+
+        _log('任务 #${task.id} 持续扫描已开启，等待下一轮扫描...');
+        await Future.delayed(const Duration(seconds: _continuousDelaySeconds));
       }
     } catch (e) {
       setState(() {
-        _status = '扫描失败: $e';
+        task.status = '扫描失败: $e';
+        _status = '任务 #${task.id} (周期 ${task.interval}) 扫描失败: $e';
       });
-      _log('扫描失败: $e');
+      _log('任务 #${task.id} 扫描失败: $e');
     } finally {
       setState(() {
-        _isLoading = false;
+        task.isRunning = false;
       });
     }
   }
@@ -366,21 +637,8 @@ class _EmaScannerPageState extends State<EmaScannerPage> {
                         ),
                         const SizedBox(width: 8),
                         ElevatedButton(
-                          onPressed: _isLoading ? null : _startScan,
-                          child: _isLoading
-                              ? const SizedBox(
-                                  height: 18,
-                                  width: 18,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                  ),
-                                )
-                              : const Text('开始扫描'),
-                        ),
-                        const SizedBox(width: 8),
-                        ElevatedButton(
-                          onPressed: _isLoading ? _stopScan : null,
-                          child: const Text('终止'),
+                          onPressed: _addTask,
+                          child: const Text('添加任务'),
                         ),
                         const SizedBox(width: 8),
                         OutlinedButton(
@@ -398,27 +656,117 @@ class _EmaScannerPageState extends State<EmaScannerPage> {
               alignment: Alignment.centerLeft,
               child: Text(_status, style: const TextStyle(fontSize: 12)),
             ),
-            const Divider(),
+            const SizedBox(height: 8),
             Expanded(
-              child: _matches.isEmpty
-                  ? const Center(
-                      child: Text(
-                        '暂无匹配结果',
-                        style: TextStyle(color: Colors.grey),
-                      ),
-                    )
-                  : ListView.builder(
-                      itemCount: _matches.length,
-                      itemBuilder: (context, index) {
-                        final m = _matches[index];
-                        return ListTile(
-                          title: Text(m.symbol),
-                          subtitle: Text(
-                            'spread=${m.spreadPct.toStringAsFixed(4)}%',
-                          ),
-                        );
-                      },
+              child: Column(
+                children: [
+                  Expanded(
+                    child: Card(
+                      elevation: 1,
+                      child: _tasks.isEmpty
+                          ? const Center(
+                              child: Text(
+                                '暂无扫描任务，先在上方选择周期并点击“添加任务”。',
+                                style: TextStyle(color: Colors.grey),
+                              ),
+                            )
+                          : ListView.builder(
+                              itemCount: _tasks.length,
+                              itemBuilder: (context, index) {
+                                final task = _tasks[index];
+                                final statusText = task.status.isEmpty
+                                    ? (task.isRunning ? '运行中' : '未开始')
+                                    : task.status;
+                                return ListTile(
+                                  title: Text(
+                                    '任务 #${task.id}  周期: ${task.interval}',
+                                  ),
+                                  subtitle: Text(
+                                    '状态: $statusText\n匹配数量: ${task.matches.length}  持续扫描: ${task.continuous ? '是' : '否'}  threshold=${task.threshold}',
+                                    maxLines: 2,
+                                  ),
+                                  isThreeLine: true,
+                                  trailing: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Checkbox(
+                                        value: task.continuous,
+                                        onChanged: (v) {
+                                          if (v == null) return;
+                                          setState(() {
+                                            task.continuous = v;
+                                          });
+                                        },
+                                      ),
+                                      IconButton(
+                                        icon: Icon(
+                                          task.isRunning
+                                              ? Icons.stop
+                                              : Icons.play_arrow,
+                                        ),
+                                        tooltip: task.isRunning
+                                            ? '停止任务'
+                                            : '开始任务',
+                                        onPressed: () {
+                                          if (task.isRunning) {
+                                            _stopTask(task);
+                                          } else {
+                                            _runScanForTask(task);
+                                          }
+                                        },
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(Icons.delete),
+                                        tooltip: '删除任务',
+                                        onPressed: () => _deleteTask(task),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
                     ),
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: Card(
+                      elevation: 1,
+                      child: Builder(
+                        builder: (context) {
+                          final entries = <_TaskMatchEntry>[];
+                          for (final task in _tasks) {
+                            for (final m in task.matches) {
+                              entries.add(_TaskMatchEntry(task.interval, m));
+                            }
+                          }
+                          if (entries.isEmpty) {
+                            return const Center(
+                              child: Text(
+                                '暂无匹配结果',
+                                style: TextStyle(color: Colors.grey),
+                              ),
+                            );
+                          }
+                          return ListView.builder(
+                            itemCount: entries.length,
+                            itemBuilder: (context, index) {
+                              final e = entries[index];
+                              return ListTile(
+                                title: Text(
+                                  '${e.match.symbol}  (${e.interval})',
+                                ),
+                                subtitle: Text(
+                                  'spread=${e.match.spreadPct.toStringAsFixed(4)}%',
+                                ),
+                              );
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ],
         ),
@@ -428,6 +776,36 @@ class _EmaScannerPageState extends State<EmaScannerPage> {
 }
 
 // ===== 网络与计算逻辑 =====
+
+class _ScanTask {
+  final int id;
+  final String interval;
+  final double threshold;
+  bool continuous;
+  bool isRunning;
+  bool cancelRequested;
+  String status;
+  List<MatchResult> matches;
+  Set<String> lastMatchedSymbols;
+
+  _ScanTask({
+    required this.id,
+    required this.interval,
+    required this.threshold,
+    this.continuous = true,
+  }) : isRunning = false,
+       cancelRequested = false,
+       status = '',
+       matches = <MatchResult>[],
+       lastMatchedSymbols = <String>{};
+}
+
+class _TaskMatchEntry {
+  final String interval;
+  final MatchResult match;
+
+  _TaskMatchEntry(this.interval, this.match);
+}
 
 // 直接访问 Binance USDT 永续合约接口，对应 Python 代码中的 BINANCE_FAPI_BASE。
 const String binanceFapiBase = 'https://fapi.binance.com';
