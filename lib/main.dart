@@ -63,6 +63,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   late TextEditingController _thresholdController;
   late TextEditingController _klinesLimitController;
   late TextEditingController _workersController;
+  late TextEditingController _newListingDaysController;
+
+  int newListingDays = 7;
 
   void _log(String message) {
     debugPrint('[EMA] $message');
@@ -80,6 +83,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       text: klinesLimit.toString(),
     );
     _workersController = TextEditingController(text: workers.toString());
+    _newListingDaysController = TextEditingController(
+      text: newListingDays.toString(),
+    );
 
     _initNotifications();
   }
@@ -90,6 +96,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     _thresholdController.dispose();
     _klinesLimitController.dispose();
     _workersController.dispose();
+    _newListingDaysController.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -294,6 +301,97 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     }
   }
 
+  Future<void> _scanNewListings() async {
+    final parsedDays =
+        int.tryParse(_newListingDaysController.text) ?? newListingDays;
+    final parsedTopN = int.tryParse(_topNController.text) ?? topN;
+    if (parsedDays <= 0) {
+      setState(() {
+        _status = '天数必须为正整数';
+      });
+      return;
+    }
+
+    setState(() {
+      _status = '扫描新币(${parsedDays}天, top=${parsedTopN}) ...';
+    });
+    try {
+      final results = await fetchNewlyListedSymbols(parsedDays, parsedTopN);
+      if (results.isEmpty) {
+        setState(() {
+          _status = '未发现最近 ${parsedDays} 天内的新币 (top ${parsedTopN})';
+        });
+        _log('未发现最近 ${parsedDays} 天内的新币 (top ${parsedTopN})');
+        await showDialog<void>(
+          context: context,
+          builder: (context) {
+            return AlertDialog(
+              title: Text('最近 ${parsedDays} 天新币 (top ${parsedTopN})'),
+              content: SizedBox(
+                width: 320,
+                child: Text('未发现最近 ${parsedDays} 天内的新币 (top ${parsedTopN})。'),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('确定'),
+                ),
+              ],
+            );
+          },
+        );
+        return;
+      }
+
+      setState(() {
+        _status =
+            '发现 ${results.length} 个最近 ${parsedDays} 天新币 (top ${parsedTopN})';
+      });
+      _log('发现 ${results.length} 个最近 ${parsedDays} 天新币 (top ${parsedTopN})');
+      await _showNewListingsDialog(results);
+    } catch (e) {
+      setState(() {
+        _status = '扫描新币失败: $e';
+      });
+      _log('扫描新币失败: $e');
+    }
+  }
+
+  Future<void> _showNewListingsDialog(List<_NewListingResult> results) async {
+    if (!mounted || results.isEmpty) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('最近上新的币种'),
+          content: SizedBox(
+            width: 360,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: results.map((r) {
+                  final d = r.listedAt.toUtc();
+                  final date =
+                      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+                  return Text(
+                    '$date  ${r.symbol}  成交额(USDT)=${r.quoteVolume.toStringAsFixed(2)}',
+                  );
+                }).toList(),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Duration? _intervalToDuration(String value) {
     final match = RegExp(r'^(\d+)([mhdw])$').firstMatch(value);
     if (match == null) return null;
@@ -326,7 +424,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   Future<DateTime> _getExchangeNowUtc() async {
     try {
       final data =
-          await httpGetJson('$binanceFapiBase/fapi/v1/time') as dynamic;
+          await httpGetJson('https://fapi.binance.com/fapi/v1/time') as dynamic;
       if (data is Map<String, dynamic>) {
         final serverTimeMs = data['serverTime'];
         if (serverTimeMs is int) {
@@ -713,6 +811,20 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                           ),
                         ),
                         const SizedBox(width: 8),
+                        SizedBox(
+                          width: 100,
+                          child: TextField(
+                            controller: _newListingDaysController,
+                            keyboardType: const TextInputType.numberWithOptions(
+                              decimal: false,
+                            ),
+                            decoration: const InputDecoration(
+                              labelText: '天数',
+                              hintText: '例如 7',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
                         ElevatedButton(
                           onPressed: _addTask,
                           child: const Text('添加任务'),
@@ -721,6 +833,11 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                         OutlinedButton(
                           onPressed: _clearResults,
                           child: const Text('清空结果'),
+                        ),
+                        const SizedBox(width: 8),
+                        OutlinedButton(
+                          onPressed: _scanNewListings,
+                          child: const Text('扫描新币'),
                         ),
                       ],
                     ),
@@ -1018,6 +1135,100 @@ Future<List<String>> fetchTopSymbolsByQuoteVolume(int topN) async {
   return result;
 }
 
+/// 返回最近 `days` 天内上新的 USDT 永续合约列表（基于 exchangeInfo 中的上架时间字段）
+Future<List<_NewListingResult>> fetchNewlyListedSymbols(
+  int days,
+  int topN,
+) async {
+  final info =
+      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
+  final results = <_NewListingResult>[];
+  if (info is! Map<String, dynamic>) return results;
+
+  final list = info['symbols'];
+  if (list is! List) return results;
+
+  final cutoffMs = DateTime.now()
+      .toUtc()
+      .subtract(Duration(days: days))
+      .millisecondsSinceEpoch;
+
+  // 预取 24h 成交量数据，用于按成交量排序
+  final tickersRaw =
+      await httpGetJson('$binanceFapiBase/fapi/v1/ticker/24hr') as dynamic;
+  final Map<String, double> volMap = {};
+  if (tickersRaw is List) {
+    for (final t in tickersRaw) {
+      if (t is! Map<String, dynamic>) continue;
+      try {
+        final sym = (t['symbol'] ?? '').toString();
+        final qv = double.tryParse((t['quoteVolume'] ?? '0').toString()) ?? 0.0;
+        volMap[sym] = qv;
+      } catch (_) {
+        continue;
+      }
+    }
+  }
+
+  for (final s in list) {
+    if (s is! Map<String, dynamic>) continue;
+    try {
+      if (s['contractType'] != 'PERPETUAL') continue;
+      if (s['status'] != 'TRADING') continue;
+      if (s['quoteAsset'] != 'USDT') continue;
+
+      final symbol = (s['symbol'] ?? '').toString();
+      if (symbol.isEmpty) continue;
+
+      dynamic timeField =
+          s['onboardDate'] ??
+          s['onboardTime'] ??
+          s['listTime'] ??
+          s['onboardAt'] ??
+          s['onboardTimestamp'];
+      int? ts;
+      if (timeField is int) ts = timeField;
+      if (timeField is String) ts = int.tryParse(timeField);
+      if (ts == null) continue;
+
+      if (ts >= cutoffMs) {
+        double qv = volMap[symbol] ?? 0.0;
+        if (qv == 0.0) {
+          try {
+            final single =
+                await httpGetJson(
+                      '$binanceFapiBase/fapi/v1/ticker/24hr',
+                      params: {'symbol': symbol},
+                    )
+                    as dynamic;
+            if (single is Map<String, dynamic>) {
+              qv =
+                  double.tryParse((single['quoteVolume'] ?? '0').toString()) ??
+                  qv;
+            }
+          } catch (_) {
+            // ignore fetch errors, keep qv as-is
+          }
+        }
+
+        results.add(
+          _NewListingResult(
+            symbol: symbol,
+            listedAt: DateTime.fromMillisecondsSinceEpoch(ts, isUtc: true),
+            quoteVolume: qv,
+          ),
+        );
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+
+  // 按成交量降序，并取前 topN
+  results.sort((a, b) => b.quoteVolume.compareTo(a.quoteVolume));
+  return results.take(topN).toList();
+}
+
 Future<List<double>> fetchKlines(
   String symbol,
   String interval,
@@ -1094,6 +1305,18 @@ class MatchResult {
   final double spreadPct;
 
   MatchResult({required this.symbol, required this.spreadPct});
+}
+
+class _NewListingResult {
+  final String symbol;
+  final DateTime listedAt;
+  final double quoteVolume;
+
+  _NewListingResult({
+    required this.symbol,
+    required this.listedAt,
+    required this.quoteVolume,
+  });
 }
 
 class _SymbolVolume {
