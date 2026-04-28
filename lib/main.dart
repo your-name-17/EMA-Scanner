@@ -810,9 +810,12 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                             ),
                           ),
                         ),
-                        const SizedBox(width: 8),
-                        SizedBox(
-                          width: 100,
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Flexible(
                           child: TextField(
                             controller: _newListingDaysController,
                             keyboardType: const TextInputType.numberWithOptions(
@@ -834,10 +837,17 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                           onPressed: _clearResults,
                           child: const Text('清空结果'),
                         ),
-                        const SizedBox(width: 8),
-                        OutlinedButton(
-                          onPressed: _scanNewListings,
-                          child: const Text('扫描新币'),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Flexible(
+                          fit: FlexFit.loose,
+                          child: OutlinedButton(
+                            onPressed: _scanNewListings,
+                            child: const Text('扫描新币(含天数和topN参数)'),
+                          ),
                         ),
                       ],
                     ),
