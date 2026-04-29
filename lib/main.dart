@@ -66,6 +66,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   late TextEditingController _newListingDaysController;
 
   int newListingDays = 7;
+  bool scanOnlyNew = false;
 
   void _log(String message) {
     debugPrint('[EMA] $message');
@@ -161,9 +162,17 @@ class _EmaScannerPageState extends State<EmaScannerPage>
 
     threshold = parsedThreshold;
     final int id = _tasks.isEmpty ? 1 : (_tasks.last.id + 1);
+    final parsedDays =
+        int.tryParse(_newListingDaysController.text) ?? newListingDays;
     setState(() {
       _tasks.add(
-        _ScanTask(id: id, interval: interval, threshold: parsedThreshold),
+        _ScanTask(
+          id: id,
+          interval: interval,
+          threshold: parsedThreshold,
+          onlyNewSymbols: scanOnlyNew,
+          newListingDays: parsedDays,
+        ),
       );
       _status = '已添加任务 #$id (周期 $interval, threshold=$parsedThreshold)';
     });
@@ -519,7 +528,16 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         }
 
         _log('任务 #${task.id} 开始新一轮扫描');
-        final symbols = await fetchTopSymbolsByQuoteVolume(topN);
+        List<String> symbols;
+        if (task.onlyNewSymbols) {
+          final newList = await fetchNewlyListedSymbols(
+            task.newListingDays,
+            topN,
+          );
+          symbols = newList.map((e) => e.symbol).toList();
+        } else {
+          symbols = await fetchTopSymbolsByQuoteVolume(topN);
+        }
         if (symbols.isEmpty) {
           setState(() {
             task.status = '未获取到任何 symbol';
@@ -851,6 +869,26 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                         ),
                       ],
                     ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Checkbox(
+                              value: scanOnlyNew,
+                              onChanged: (v) {
+                                if (v == null) return;
+                                setState(() {
+                                  scanOnlyNew = v;
+                                });
+                              },
+                            ),
+                            const Text('仅在新币中扫描EMA'),
+                          ],
+                        ),
+                      ],
+                    ),
                   ],
                 ),
               ),
@@ -985,6 +1023,8 @@ class _ScanTask {
   final int id;
   final String interval;
   final double threshold;
+  final bool onlyNewSymbols;
+  final int newListingDays;
   bool continuous;
   bool isRunning;
   bool cancelRequested;
@@ -996,6 +1036,8 @@ class _ScanTask {
     required this.id,
     required this.interval,
     required this.threshold,
+    this.onlyNewSymbols = false,
+    this.newListingDays = 7,
     this.continuous = true,
   }) : isRunning = false,
        cancelRequested = false,
