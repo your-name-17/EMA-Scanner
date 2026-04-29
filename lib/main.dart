@@ -22,7 +22,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Binance EMA Scanner',
+      title: 'Binance EMA+MA Scanner',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
@@ -42,6 +42,10 @@ class EmaScannerPage extends StatefulWidget {
 class _EmaScannerPageState extends State<EmaScannerPage>
     with WidgetsBindingObserver {
   String _status = '';
+
+  // 为了让 EMA120 更贴近交易所图表，需要更长历史进行预热。
+  static const int _indicatorWarmupKlines = 1000;
+  static const int _binanceKlinesMaxLimit = 1500;
 
   String interval = '1d';
   int topN = 100;
@@ -115,7 +119,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
 
     const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
     const windowsInit = WindowsInitializationSettings(
-      appName: 'Binance EMA Scanner',
+      appName: 'Binance EMA+MA Scanner',
       appUserModelId: 'dev.trading.ema_scanner',
       guid: 'd49b0314-ee7a-4626-bf79-97cdb8a991bb',
     );
@@ -489,11 +493,11 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     if (parsedTopN == null ||
         parsedTopN <= 0 ||
         parsedKlinesLimit == null ||
-        parsedKlinesLimit < 100 ||
+        parsedKlinesLimit < 121 ||
         parsedWorkers == null ||
         parsedWorkers <= 0) {
       setState(() {
-        _status = '参数不合法，请检查 topN、threshold、klinesLimit（>=100）、workers（>0）';
+        _status = '参数不合法，请检查 topN、threshold、klinesLimit（>=121）、workers（>0）';
         task.status = '参数不合法，无法启动任务';
       });
       _log(
@@ -562,16 +566,23 @@ class _EmaScannerPageState extends State<EmaScannerPage>
             return null;
           }
           try {
+            final indicatorLimit = math.min(
+              math.max(klinesLimit, _indicatorWarmupKlines),
+              _binanceKlinesMaxLimit,
+            );
+            _log(
+              '任务 #${task.id} [$localIdx/$total] $symbol 使用K线数量=$indicatorLimit (UI klinesLimit=$klinesLimit)',
+            );
             final closes = await fetchKlines(
               symbol,
               task.interval,
-              klinesLimit,
+              indicatorLimit,
             );
             final List<double> closedCloses = closes.length > 1
                 ? closes.sublist(0, closes.length - 1)
                 : [];
 
-            if (closedCloses.length < 100) {
+            if (closedCloses.length < 120) {
               if (!mounted) return null;
               setState(() {
                 task.status = '[$localIdx/$total] $symbol 跳过(数据不足)';
@@ -582,23 +593,50 @@ class _EmaScannerPageState extends State<EmaScannerPage>
               return null;
             }
 
-            final e7 = ema(closedCloses, 7);
-            final e25 = ema(closedCloses, 25);
-            final e99 = ema(closedCloses, 99);
+            final ema20 = ema(closedCloses, 20);
+            final ema60 = ema(closedCloses, 60);
+            final ema120 = ema(closedCloses, 120);
+            final ma20 = ma(closedCloses, 20);
+            final ma60 = ma(closedCloses, 60);
+            final ma120 = ma(closedCloses, 120);
 
-            if (e7 == null || e25 == null || e99 == null) {
+            if (ema20 == null || ema60 == null || ema120 == null || ma20 == null || ma60 == null || ma120 == null) {
               if (!mounted) return null;
               setState(() {
-                task.status = '[$localIdx/$total] $symbol 跳过(EMA 计算失败)';
+                task.status = '[$localIdx/$total] $symbol 跳过(均线计算失败)';
                 _status =
-                    '任务 #${task.id} (周期 ${task.interval}) $symbol 跳过(EMA 计算失败) [$localIdx/$total]';
+                    '任务 #${task.id} (周期 ${task.interval}) $symbol 跳过(均线计算失败) [$localIdx/$total]';
               });
-              _log('任务 #${task.id} [$localIdx/$total] $symbol 跳过(EMA 计算失败)');
+              _log('任务 #${task.id} [$localIdx/$total] $symbol 跳过(均线计算失败)');
               return null;
             }
 
-            final result = isEmaConverged(e7, e25, e99, taskThreshold);
+            final result = isDense6([
+              ema20,
+              ema60,
+              ema120,
+              ma20,
+              ma60,
+              ma120,
+            ], taskThreshold);
             final spreadPct = result.spread * 100.0;
+            final lines = <double>[ema20, ema60, ema120, ma20, ma60, ma120];
+            final mn = lines.reduce(math.min);
+            final mx = lines.reduce(math.max);
+            _log(
+              '任务 #${task.id} [$localIdx/$total] $symbol 明细 '
+              'EMA20=${ema20.toStringAsFixed(6)} '
+              'EMA60=${ema60.toStringAsFixed(6)} '
+              'EMA120=${ema120.toStringAsFixed(6)} '
+              'MA20=${ma20.toStringAsFixed(6)} '
+              'MA60=${ma60.toStringAsFixed(6)} '
+              'MA120=${ma120.toStringAsFixed(6)} '
+              'min=${mn.toStringAsFixed(6)} '
+              'max=${mx.toStringAsFixed(6)} '
+              'spread=${spreadPct.toStringAsFixed(4)}% '
+              'threshold=${(taskThreshold * 100).toStringAsFixed(4)}% '
+              'ok=${result.ok}',
+            );
 
             if (result.ok) {
               final m = MatchResult(symbol: symbol, spreadPct: spreadPct);
@@ -606,13 +644,13 @@ class _EmaScannerPageState extends State<EmaScannerPage>
               if (task.cancelRequested) return null;
               setState(() {
                 task.status =
-                    '[$localIdx/$total] $symbol 发现匹配 spread=${spreadPct.toStringAsFixed(4)}%';
+                    '[$localIdx/$total] $symbol 发现 EMA+MA 密集 spread=${spreadPct.toStringAsFixed(4)}%';
                 _status =
-                    '任务 #${task.id} (周期 ${task.interval}) $symbol 发现匹配 spread=${spreadPct.toStringAsFixed(4)}% [$localIdx/$total]';
+                    '任务 #${task.id} (周期 ${task.interval}) $symbol 发现 EMA+MA 密集 spread=${spreadPct.toStringAsFixed(4)}% [$localIdx/$total]';
                 task.matches = [...task.matches, m];
               });
               _log(
-                '任务 #${task.id} [$localIdx/$total] $symbol 发现匹配 spread=${spreadPct.toStringAsFixed(4)}%',
+                '任务 #${task.id} [$localIdx/$total] $symbol 发现 EMA+MA 密集 spread=${spreadPct.toStringAsFixed(4)}%',
               );
               return m;
             } else {
@@ -620,12 +658,12 @@ class _EmaScannerPageState extends State<EmaScannerPage>
               if (task.cancelRequested) return null;
               setState(() {
                 task.status =
-                    '[$localIdx/$total] $symbol 不满足阈值 spread=${spreadPct.toStringAsFixed(4)}%';
+                    '[$localIdx/$total] $symbol 不满足 EMA+MA 密集 spread=${spreadPct.toStringAsFixed(4)}%';
                 _status =
-                    '任务 #${task.id} (周期 ${task.interval}) $symbol 不满足阈值 spread=${spreadPct.toStringAsFixed(4)}% [$localIdx/$total]';
+                    '任务 #${task.id} (周期 ${task.interval}) $symbol 不满足 EMA+MA 密集 spread=${spreadPct.toStringAsFixed(4)}% [$localIdx/$total]';
               });
               _log(
-                '任务 #${task.id} [$localIdx/$total] $symbol 不满足阈值 spread=${spreadPct.toStringAsFixed(4)}%',
+                '任务 #${task.id} [$localIdx/$total] $symbol 不满足 EMA+MA 密集 spread=${spreadPct.toStringAsFixed(4)}%',
               );
               return null;
             }
@@ -736,7 +774,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Binance USDT EMA(7/25/99) 扫描器')),
+      appBar: AppBar(title: const Text('Binance USDT EMA+MA(20/60/120) 扫描器')),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -811,7 +849,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                             ),
                             decoration: const InputDecoration(
                               labelText: 'klinesLimit',
-                              hintText: '例如 120 (>=100)',
+                              hintText: '例如 150 (>=121)',
                             ),
                           ),
                         ),
@@ -1318,14 +1356,27 @@ double? ema(List<double> values, int span) {
     return null;
   }
 
+  // Binance/主流行情图表常见做法：以第一根收盘价为初值递推 EMA。
   final alpha = 2.0 / (span + 1.0);
-  double e = values.take(span).reduce((a, b) => a + b) / span.toDouble();
+  double e = values.first;
 
-  for (var i = span; i < values.length; i++) {
+  for (var i = 1; i < values.length; i++) {
     final x = values[i];
     e = alpha * x + (1.0 - alpha) * e;
   }
   return e;
+}
+
+double? ma(List<double> values, int span) {
+  if (span <= 0) {
+    throw ArgumentError('span 必须为正数');
+  }
+  if (values.length < span) {
+    return null;
+  }
+
+  final window = values.sublist(values.length - span);
+  return window.reduce((a, b) => a + b) / span.toDouble();
 }
 
 class ConvergeResult {
@@ -1335,15 +1386,9 @@ class ConvergeResult {
   ConvergeResult(this.ok, this.spread);
 }
 
-ConvergeResult isEmaConverged(
-  double e7,
-  double e25,
-  double e99,
-  double threshold,
-) {
-  final ems = [e7, e25, e99];
-  final mn = ems.reduce(math.min);
-  final mx = ems.reduce(math.max);
+ConvergeResult isDense6(List<double> averages, double threshold) {
+  final mn = averages.reduce(math.min);
+  final mx = averages.reduce(math.max);
   final mnAbs = mn.abs();
   if (mnAbs == 0) {
     return ConvergeResult(false, double.infinity);
