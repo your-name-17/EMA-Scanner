@@ -45,7 +45,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
 
   // 为了让 EMA120 更贴近交易所图表，需要更长历史进行预热。
   static const int _indicatorWarmupKlines = 1000;
-  static const int _binanceKlinesMaxLimit = 1500;
+  static const int _binanceKlinesMaxLimit = binanceKlinesMaxLimit;
 
   String interval = '1d';
   int topN = 100;
@@ -370,6 +370,67 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     }
   }
 
+  Future<void> _scanNewListingsByLifetimeVolume() async {
+    final parsedDays =
+        int.tryParse(_newListingDaysController.text) ?? newListingDays;
+    final parsedTopN = int.tryParse(_topNController.text) ?? topN;
+    if (parsedDays <= 0) {
+      setState(() {
+        _status = '天数必须为正整数';
+      });
+      return;
+    }
+
+    setState(() {
+      _status = '扫描新币(${parsedDays}天, 按全时成交额排序, top=${parsedTopN}) ...';
+    });
+    try {
+      final results = await fetchNewlyListedSymbolsByLifetimeVolume(
+        parsedDays,
+        parsedTopN,
+      );
+      if (results.isEmpty) {
+        setState(() {
+          _status = '未发现最近 ${parsedDays} 天内的新币 (top ${parsedTopN})';
+        });
+        _log('未发现最近 ${parsedDays} 天内的新币 (top ${parsedTopN})');
+        await showDialog<void>(
+          context: context,
+          builder: (context) {
+            return AlertDialog(
+              title: Text('最近 ${parsedDays} 天新币-全时成交额排序 (top ${parsedTopN})'),
+              content: SizedBox(
+                width: 320,
+                child: Text('未发现最近 ${parsedDays} 天内的新币 (top ${parsedTopN})。'),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('确定'),
+                ),
+              ],
+            );
+          },
+        );
+        return;
+      }
+
+      setState(() {
+        _status =
+            '发现 ${results.length} 个最近 ${parsedDays} 天新币 (按全时成交额排序, top ${parsedTopN})';
+      });
+      _log(
+        '发现 ${results.length} 个最近 ${parsedDays} 天新币 (按全时成交额排序, top ${parsedTopN})',
+      );
+      await _showNewListingsByLifetimeVolumeDialog(results);
+    } catch (e) {
+      setState(() {
+        _status = '扫描新币(全时成交额)失败: $e';
+      });
+      _log('扫描新币(全时成交额)失败: $e');
+    }
+  }
+
   Future<void> _showNewListingsDialog(List<_NewListingResult> results) async {
     if (!mounted || results.isEmpty) return;
 
@@ -377,7 +438,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: const Text('最近上新的币种'),
+          title: const Text('最近上新的币种 (24h成交额排序)'),
           content: SizedBox(
             width: 360,
             child: SingleChildScrollView(
@@ -388,7 +449,44 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                   final date =
                       '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
                   return Text(
-                    '$date  ${r.symbol}  成交额(USDT)=${r.quoteVolume.toStringAsFixed(2)}',
+                    '$date  ${r.symbol}  24h成交额=${r.quoteVolume.toStringAsFixed(2)}',
+                  );
+                }).toList(),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showNewListingsByLifetimeVolumeDialog(
+    List<_NewListingResult> results,
+  ) async {
+    if (!mounted || results.isEmpty) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('最近上新的币种 (全时成交额排序)'),
+          content: SizedBox(
+            width: 360,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: results.map((r) {
+                  final d = r.listedAt.toUtc();
+                  final date =
+                      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+                  return Text(
+                    '$date  ${r.symbol}  全时成交额=${r.quoteVolume.toStringAsFixed(2)}',
                   );
                 }).toList(),
               ),
@@ -936,7 +1034,19 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                 fit: FlexFit.loose,
                                 child: OutlinedButton(
                                   onPressed: _scanNewListings,
-                                  child: const Text('扫描新币(含天数和topN参数)'),
+                                  child: const Text('扫描新币(24h成交额排序)'),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Flexible(
+                                fit: FlexFit.loose,
+                                child: OutlinedButton(
+                                  onPressed: _scanNewListingsByLifetimeVolume,
+                                  child: const Text('扫描新币(全时成交额排序)'),
                                 ),
                               ),
                             ],
@@ -1126,6 +1236,7 @@ class _TaskMatchEntry {
 
 // 直接访问 Binance USDT 永续合约接口，对应 Python 代码中的 BINANCE_FAPI_BASE。
 const String binanceFapiBase = 'https://fapi.binance.com';
+const int binanceKlinesMaxLimit = 1500;
 
 Future<dynamic> httpGetJson(
   String url, {
@@ -1256,6 +1367,227 @@ Future<List<String>> fetchTopSymbolsByQuoteVolume(int topN) async {
   filtered.sort((a, b) => b.quoteVolume.compareTo(a.quoteVolume));
   final result = filtered.take(topN).map((e) => e.symbol).toList();
   return result;
+}
+
+/// 返回最近 `days` 天内上新的币种，按自发行以来的累计 futures USDT 成交额排序。
+/// 只检查发行时间落在 `days` 天以内的币种；成交额通过逐笔成交聚合计算。
+Future<List<_NewListingResult>> fetchNewlyListedSymbolsByLifetimeVolume(
+  int days,
+  int topN,
+) async {
+  final info =
+      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
+  final results = <_NewListingResult>[];
+  if (info is! Map<String, dynamic>) return results;
+
+  final list = info['symbols'];
+  if (list is! List) return results;
+
+  final cutoffMs = DateTime.now()
+      .toUtc()
+      .subtract(Duration(days: days))
+      .millisecondsSinceEpoch;
+
+  for (final s in list) {
+    if (s is! Map<String, dynamic>) continue;
+    try {
+      if (s['contractType'] != 'PERPETUAL') continue;
+      if (s['status'] != 'TRADING') continue;
+      if (s['quoteAsset'] != 'USDT') continue;
+
+      final symbol = (s['symbol'] ?? '').toString();
+      if (symbol.isEmpty) continue;
+
+      dynamic timeField =
+          s['onboardDate'] ??
+          s['onboardTime'] ??
+          s['listTime'] ??
+          s['onboardAt'] ??
+          s['onboardTimestamp'];
+      int? ts;
+      if (timeField is int) ts = timeField;
+      if (timeField is String) ts = int.tryParse(timeField);
+      if (ts == null) continue;
+
+      if (ts >= cutoffMs) {
+        // 通过逐笔成交聚合计算 futures 合约自发行以来的累计 USDT 成交额。
+        double lifetimeVolume = 0.0;
+        try {
+          lifetimeVolume = await fetchFuturesLifetimeQuoteVolume(symbol, ts);
+        } catch (e) {
+          debugPrint('[EMA] 获取 $symbol futures累计成交额失败: $e');
+          lifetimeVolume = 0.0;
+        }
+
+        results.add(
+          _NewListingResult(
+            symbol: symbol,
+            listedAt: DateTime.fromMillisecondsSinceEpoch(ts, isUtc: true),
+            quoteVolume: lifetimeVolume,
+          ),
+        );
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+
+  // 按lifetime成交额降序，并取前 topN
+  results.sort((a, b) => b.quoteVolume.compareTo(a.quoteVolume));
+  return results.take(topN).toList();
+}
+
+Future<double> fetchFuturesLifetimeQuoteVolume(
+  String symbol,
+  int listingTimeMs,
+) async {
+  // 首先尝试使用日线K线聚合（较少请求，低限流风险）
+  try {
+    final listedAt = DateTime.fromMillisecondsSinceEpoch(
+      listingTimeMs,
+      isUtc: true,
+    );
+    final ageDays = DateTime.now().toUtc().difference(listedAt).inDays;
+    final klineLimit = math.min(ageDays + 1, binanceKlinesMaxLimit);
+
+    debugPrint(
+      '[EMA][VOL] $symbol listed=$listedAt ageDays=$ageDays klineLimit=$klineLimit',
+    );
+
+    final klines =
+        await httpGetJson(
+              '$binanceFapiBase/fapi/v1/klines',
+              params: {
+                'symbol': symbol,
+                'interval': '1d',
+                'limit': '$klineLimit',
+              },
+            )
+            as dynamic;
+
+    if (klines is List && klines.isNotEmpty) {
+      double total = 0.0;
+      var idx = 0;
+      for (final k in klines) {
+        try {
+          if (k is List && k.length > 7) {
+            final quoteVol = double.tryParse(k[7].toString()) ?? 0.0;
+            // 如需逐根 K 线明细，取消下面注释：
+            // final openTimeMs = k.isNotEmpty
+            //     ? int.tryParse(k[0].toString())
+            //     : null;
+            // final openTime = openTimeMs == null
+            //     ? 'unknown'
+            //     : DateTime.fromMillisecondsSinceEpoch(
+            //         openTimeMs,
+            //         isUtc: true,
+            //       ).toIso8601String();
+            // debugPrint(
+            //   '[EMA][VOL] $symbol kline[$idx] open=$openTime quoteVol=${quoteVol.toStringAsFixed(2)}',
+            // );
+            total += quoteVol;
+            idx += 1;
+          }
+        } catch (_) {
+          continue;
+        }
+      }
+      debugPrint(
+        '[EMA][VOL] $symbol klinesCount=${klines.length} sum=${total.toStringAsFixed(2)}',
+      );
+      return total;
+    }
+  } catch (e) {
+    debugPrint('[EMA] 日线聚合失败，准备回退到逐笔聚合: $e');
+  }
+
+  // 回退到逐笔聚合（aggTrades）——带指数退避和小延迟以降低限流风险
+  var totalQuoteVolume = 0.0;
+  var fromId = 0;
+  var hasMore = true;
+  var consecutive429 = 0;
+  var pageCount = 0;
+
+  debugPrint('[EMA][VOL] $symbol fallback aggTrades startTime=$listingTimeMs');
+
+  while (hasMore) {
+    final params = <String, String>{
+      'symbol': symbol,
+      'limit': '1000',
+      'startTime': fromId == 0 ? '$listingTimeMs' : '',
+    };
+    params.removeWhere((key, value) => value.isEmpty);
+    if (fromId > 0) params['fromId'] = '$fromId';
+
+    try {
+      final data =
+          await httpGetJson(
+                '$binanceFapiBase/fapi/v1/aggTrades',
+                params: params,
+              )
+              as dynamic;
+
+      if (data is! List || data.isEmpty) break;
+
+      for (final item in data) {
+        if (item is! Map<String, dynamic>) continue;
+        final price = double.tryParse((item['p'] ?? '0').toString()) ?? 0.0;
+        final qty = double.tryParse((item['q'] ?? '0').toString()) ?? 0.0;
+        totalQuoteVolume += price * qty;
+      }
+
+      pageCount += 1;
+      if (pageCount == 1 || pageCount % 10 == 0) {
+        debugPrint(
+          '[EMA][VOL] $symbol aggTrades pages=$pageCount fromId=$fromId sum=${totalQuoteVolume.toStringAsFixed(2)}',
+        );
+      }
+
+      consecutive429 = 0;
+
+      if (data.length < 1000) break;
+
+      final last = data.last;
+      if (last is Map<String, dynamic>) {
+        final lastId = last['a'];
+        if (lastId is int) {
+          fromId = lastId + 1;
+        } else if (lastId is String) {
+          fromId = (int.tryParse(lastId) ?? fromId) + 1;
+        } else {
+          hasMore = false;
+        }
+      } else {
+        hasMore = false;
+      }
+
+      await Future.delayed(Duration(milliseconds: 200));
+    } catch (e) {
+      final err = e.toString();
+      if (err.contains('HTTP 429')) {
+        consecutive429 += 1;
+        final backoffMs = math.min(
+          1000 * math.pow(2, consecutive429).toInt(),
+          16000,
+        );
+        debugPrint('[EMA] 收到 429，退避 ${backoffMs}ms (count=$consecutive429)');
+        await Future.delayed(Duration(milliseconds: backoffMs));
+        if (consecutive429 >= 5) {
+          debugPrint('[EMA] 429 重试过多，停止逐笔聚合');
+          break;
+        }
+        continue;
+      }
+
+      debugPrint('[EMA] 逐笔聚合异常，停止: $e');
+      break;
+    }
+  }
+
+  debugPrint(
+    '[EMA][VOL] $symbol aggTrades done pages=$pageCount sum=${totalQuoteVolume.toStringAsFixed(2)}',
+  );
+  return totalQuoteVolume;
 }
 
 /// 返回最近 `days` 天内上新的 USDT 永续合约列表（基于 exchangeInfo 中的上架时间字段）
