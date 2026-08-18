@@ -1,29 +1,21 @@
 # PerpScope
 
-**PerpScope** 是一款面向 Binance USDT 永续合约的 Flutter 扫描工具，帮助你在交易前快速发现：
+Binance USDT 永续合约扫描工具（Flutter）。用于 6 线密度扫描、新币/发行日查询、密集后趋势观察，以及在 Binance 页面上按队列顺序浏览结果。
 
-- 多条均线**高密度收敛**的币种
-- 收敛后**沿趋势持续运行**的币种
-- 最近上新、成交额活跃的新币
-
-支持 **Windows / macOS / Linux / Android / Web** 多平台，并提供系统级通知与一键跳转 Binance 交易页。
-
-> 本项目仅用于技术研究与策略观察，不构成任何投资建议。
+支持平台：Windows / macOS / Linux、Android、Web。
 
 ---
 
 ## 功能概览
 
-### 1. 6 线混合密度扫描（核心）
+### 1. 6 线混合密度扫描
 
-从 Binance USDT-M 永续合约中，按 **24h quoteVolume** 选取前 `topN` 个交易对，拉取 K 线并计算 6 条指标线：
+从 USDT-M 永续合约中按 24h 成交额取前 `topN`，拉取 K 线后计算：
 
-| 类型 | 周期 |
-|------|------|
-| EMA | 20 / 60 / 120 |
-| MA  | 20 / 60 / 120 |
+- EMA(20 / 60 / 120)
+- MA(20 / 60 / 120)
 
-当 6 条线足够接近时，判定为**高密度收敛**：
+密度公式：
 
 $$
 mn = \min(\text{6条线}),\quad
@@ -31,236 +23,198 @@ mx = \max(\text{6条线}),\quad
 spread = \frac{mx - mn}{|mn|}
 $$
 
-当 `spread <= threshold` 时视为匹配。
+`spread <= threshold` 视为匹配。扫描包含当前未走完的 K 线；内部会把 K 线数量至少扩展到 1000 根，保证 EMA120 / MA120 充分热身。
 
-**实现要点：**
+### 2. 新币与发行日
 
-- 扫描时使用**已收线 K 线**（自动丢弃最后一根未走完的 K 线），避免未定型数据干扰。
-- 内部会将 K 线数量自动扩展到至少 **1000 根**（上限 1500），保证 EMA120 / MA120 充分热身。
-- EMA 采用 Binance 图表常见算法：以第一根收盘价为初值递推（`alpha = 2 / (span + 1)`）。
-- MA 取最近 `span` 根收盘价的简单平均。
-- 可通过「天数」参数限制扫描范围：仅包含**上市不超过 N 天**的合约（默认 550 天）。
+- **扫描新币(24h成交额排序)**：最近 N 天上新，按 24h 成交额排序。
+- **扫描新币(全时成交额排序)**：最近 N 天上新，按上市以来累计成交额排序（优先日线 `quoteVolume`，失败再回退 aggTrades）。
+- **查询发行币种**：先选起始/终止日期，再查该区间内上线的 USDT 永续合约。
+- **扫描稳定币种(<100倍波动)**：自上市以来日线高低点倍数低于 100 的币种。
 
-### 2. 多任务并发扫描
+上市天数过滤（多数扫描共用）：
 
-- 可同时创建多个任务，每个任务独立设置 **周期** 与 **threshold**。
-- 每个任务可单独**开始 / 停止 / 删除**，结果互不干扰。
-- 支持 **workers** 并发拉取 K 线，加快扫描速度。
-- 默认开启**连续扫描**：对齐 Binance 服务器时间，在每根 K 线**收线后**自动进入下一轮（非固定秒数轮询）。
+- **天数≤**：只看上市不超过这么多天的币（默认 550）。
+- **天数>**：只看上市超过这么多天的币（默认 0）。
 
-### 3. 密集后持续方向
+### 3. 密集后上升趋势
 
-在 6 线密集收敛之后，进一步识别价格是否沿趋势持续运行：
+- **扫描密集后上升趋势**：在密度收敛之后，寻找后续上升形态。
+- **回测密集后上升趋势**：对同一规则做历史回测。
 
-**实时扫描（「扫描密集后持续方向」）**
+### 4. 多任务与连续扫描
 
-1. 从最新 K 线向前回溯，找到最近一次 6 线密集区；
-2. 在密集点前后各 15 根 K 线窗口内，对 EMA/MA 的 20/60/120 六组快慢线综合投票，判定金叉 / 死叉方向；
-3. 检查密集结束后价格是否沿 MA20 顺势运行（贴线比例 ≥ 75%），且净变动与叉方向一致；
-4. 结果按上涨 / 下跌分组展示，包含时间区间、密集 spread、持续 K 线数、净变动等指标。
+可同时添加多个任务（不同周期、阈值）。每个任务可单独开始、停止、删除。开启连续扫描后，会等到该周期下一根 K 线收线再扫下一轮（优先用 Binance 服务器时间）。
 
-**历史回测（「回测密集后持续方向」）**
+仅对本轮**新出现**的匹配币种发通知，避免重复提醒。
 
-- 在历史 K 线中寻找所有非重叠的「密集 → 顺势」时间段；
-- 回测逻辑：密集区内判叉 → 沿 MA20 + EMA20 顺势；趋势超过 10 根后破势则截段记录；
-- 适用于验证策略在历史数据上的表现。
+### 5. 顺序浏览 Binance
 
-### 4. 新币扫描
+扫描或查询出结果后，不必逐个点链接：
 
-| 按钮 | 排序方式 | 说明 |
-|------|----------|------|
-| 扫描新币(24h成交额排序) | 24h quoteVolume | 筛选最近 N 天内上新的 USDT 永续合约 |
-| 扫描新币(全时成交额排序) | 自发行累计成交额 | 优先用 1d K 线 `quoteVolume` 汇总；失败时回退到 aggTrades 逐笔聚合（含 429 退避） |
+1. 点 **开始浏览**，或在结果弹窗里点 **开始顺序浏览**。
+2. 会一次打开当前批次 **3 个** 币种标签页。
+3. **下一个(+3) / 上一个(-3)** 每次再新开 3 个标签，**不会关掉或覆盖已经打开的页**。
+4. 结果弹窗会继续留着，点 **确定** 才关闭。
 
-### 5. 指定时间发行币种查询
+链接模式：
 
-选择**起始日期**与**终止日期**，查询该时间段内上架的 USDT 永续合约，并按 24h 成交额降序展示。
-
-### 6. 智能提醒
-
-- 仅对**本轮新出现**的匹配币种提醒，避免重复轰炸。
-- 某币种中途消失后再次匹配，会重新提醒。
-- 平台策略：
-  - **Windows / macOS / Linux**：前台弹窗，后台系统通知。
-  - **Android**：统一走系统通知栏。
-  - **Web**：浏览器通知（需授权）；未授权时回退为弹窗。
-
-### 7. 交易链接跳转
-
-点击结果中的币种名称，可一键打开 Binance 页面。支持两种链接模式：
-
-| 模式 | 行为 |
-|------|------|
-| 合约 | 跳转 USDT 永续合约页 |
-| 现货/Alpha | 优先匹配现货交易对；若无则跳转 Alpha 代币页 |
+- **合约**：打开永续合约页。
+- **现货/Alpha**：优先现货，找不到再走 Alpha。
 
 ---
 
-## 界面与操作流程
+## Binance 顺序浏览（Tampermonkey）
 
-```
-1. 设置参数（周期、topN、threshold、klinesLimit、workers、天数）
-2. 点击「添加任务」→ 在任务列表中点击 ▶ 开始扫描
-3. 匹配结果出现在底部结果面板；点击币种名可跳转 Binance
-4. 新币 / 趋势 / 回测功能可独立使用，不依赖扫描任务
-```
+Web 端建议配合油猴脚本，在 Binance 页里也能切队列。
 
-**支持的 K 线周期：** `3m` / `15m` / `1h` / `4h` / `1d`
+脚本路径：[`tools/tampermonkey/perpscope-binance-browser.user.js`](tools/tampermonkey/perpscope-binance-browser.user.js)（当前 **v0.4.0**）。
+
+### 安装
+
+1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)。
+2. 用脚本内容新建用户脚本并保存。
+3. 更新脚本后请覆盖安装到同一条，不要留着旧版本。
+
+### 用法
+
+1. 先在 PerpScope 点 **开始浏览** / **开始顺序浏览**（浏览器可能拦截弹窗，需允许本站点弹窗）。
+2. 打开的 Binance 页右下角有 **Prev -3 / Next +3**。
+3. 快捷键同样每次跳 3 个：**[ ]**、**← →**、**J K**、**PageUp / PageDown**（焦点在图表 iframe 里时可能无效，用按钮即可）。
+
+脚本不会把当前标签导航走，下一组 3 个会新开；已打开的标签会保留。
 
 ---
 
 ## 参数说明
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| interval | `1d` | K 线周期（添加任务时锁定） |
-| topN | `100` | 按 24h quoteVolume 取前 N 个合约 |
-| threshold | `0.2` | 收敛阈值，`0.2` 表示 6 线 spread ≤ 20%。数值越小越严格 |
-| klinesLimit | `1500` | 每个交易对拉取的 K 线数（≥ 121；内部至少扩展到 1000） |
-| workers | `8` | 并发请求数，建议 8 ~ 20，视网络情况调整 |
-| 天数 | `550` | 扫描时仅包含上市不超过 N 天的合约 |
-| 连续扫描 | 默认开启 | 每根 K 线收线后自动重复扫描 |
+### 任务参数
 
-### 实用建议
+- **周期**：3m / 15m / 1h / 4h / 1d
+- **topN**：按 24h 成交额取前 N 个
+- **threshold**：密度阈值（建议 0.05 ~ 0.20）
+- **klinesLimit**：请求根数；内部至少扩到 1000
+- **workers**：并发数（建议 8 ~ 20）
+- **天数≤ / 天数>**：上市天数区间
+- **仅在新币中扫描EMA**：密度任务只扫新币池
 
-- **更快发现信号**：选较短周期（3m / 15m），适当提高 workers。
-- **更稳健结果**：选较长周期（1h / 4h / 1d），适当减小 threshold。
-- **结果过少**：增大 threshold 或 topN。
-- **请求超时 / 429 偏多**：降低 workers，或检查网络。
-- **新币研究**：将「天数」设为 3 ~ 30，配合新币扫描按钮使用。
+### 使用建议
+
+- 更快发现：短周期（3m/15m），略提高 workers。
+- 更稳：长周期（1h/4h/1d）。
+- 结果太少：加大 threshold 或 topN。
+- 超时/限流多：减小 workers，降低连点扫描的频率。
 
 ---
 
 ## 环境要求
 
-- Flutter SDK **3.9+**（stable）
-- Dart SDK（随 Flutter 附带）
-- 可访问 `fapi.binance.com` 及相关 Binance API
-- Android 打包需 Android SDK
+- Flutter SDK 3.9+
+- 可访问 `https://fapi.binance.com`
 
-### 主要依赖
-
-| 包 | 用途 |
-|----|------|
-| `http` | Binance API 请求 |
-| `flutter_local_notifications` | Windows / Android 系统通知 |
-| `url_launcher` | 跳转 Binance 交易页 |
+主要依赖：`http`、`flutter_local_notifications`、`url_launcher`、`shared_preferences`。
 
 ---
 
 ## 快速开始
 
-### 安装依赖
-
 ```bash
 flutter pub get
+flutter run -d windows    # 桌面
+flutter run -d chrome     # Web
+flutter run               # Android 真机
 ```
 
-### 桌面运行（Windows）
+Web 调试也可用：
 
 ```bash
-flutter run -d windows
-```
-
-### Web 运行
-
-```bash
-flutter run -d chrome
-```
-
-> Web 端若遇到 CORS 限制，建议优先使用桌面或 Android 版本。
-
-### Android 真机
-
-```bash
-flutter run
+flutter run -d web-server
 ```
 
 ---
 
-## 打包
-
-### Android 调试包
+## Android 打包
 
 ```bash
 flutter build apk --debug
-```
-
-产物：`build/app/outputs/flutter-apk/app-debug.apk`
-
-### Android 发布包
-
-```bash
 flutter build apk --release
 ```
 
-发布包需自行配置签名，参考 [Flutter Android 部署文档](https://docs.flutter.dev/deployment/android)。
+产物：`build/app/outputs/flutter-apk/`
 
-### 已内置的 Android 配置
-
-- `POST_NOTIFICATIONS`、`VIBRATE` 权限
-- Core Library Desugaring（兼容 `flutter_local_notifications` v21）
-
----
-
-## 网络说明
-
-- 桌面 / Android 端 HTTP 客户端配置为 **直连**（`findProxy = DIRECT`），不使用系统代理。
-- 若需通过代理访问 Binance，请在系统层面配置，或修改 `lib/main.dart` 中 `httpGetJson` 的代理逻辑。
-- 请求内置重试与 429 / 5xx 退避，但仍建议在稳定网络环境下使用。
+- 已声明 `POST_NOTIFICATIONS`、`VIBRATE`。
+- 已启用 core library desugaring（配合 `flutter_local_notifications`）。
+- 发布包需要自行配置签名。
 
 ---
 
-## 项目结构
+## 通知
 
-```
-lib/
-├── main.dart                                      # UI、任务调度、扫描算法、通知
-└── web_notifications/
-    ├── web_notification_service_web.dart          # Web 浏览器通知
-    └── web_notification_service_stub.dart         # 非 Web 平台占位
-```
-
-### 核心机制
-
-| 模块 | 说明 |
-|------|------|
-| 多任务模型 | 每个任务独立 threshold、运行状态、匹配列表与上轮匹配集合 |
-| 差集提醒 | `currentSymbols` 与 `lastMatchedSymbols` 做差集，仅对新出现的币种通知 |
-| K 线对齐 | 连续扫描按 interval 对齐下一根 K 线收线时刻，优先使用 Binance 服务器时间 |
-| 6 线密度 | EMA + MA 混合判断，捕捉快慢均线共同收敛的信号 |
-| 趋势延续 | 密集区判叉 + MA20 贴线 + MA120 方向过滤，识别收敛后的单边运行 |
+- **Android 13+**：首次启动会请求通知权限。
+- **桌面**：前台弹窗，后台走系统通知。
+- **Web**：首次通知时请求浏览器授权。
 
 ---
 
 ## 常见问题
 
-**连续扫描为什么不是每隔几秒就触发？**
+### 查询发行币种没反应？
 
-这是预期行为。连续扫描会等到当前周期 K 线收线后再扫描，而不是固定间隔轮询。
+先选 **起始日期** 和 **终止日期**。未选日期时状态栏会提示，不会静默卡住。
 
-**为什么看起来通知较少？**
+### HTTP 418 / IP 被限流？
 
-只对「本轮新出现」的匹配币种提醒；同一币种连续多轮命中不会重复通知。
+这是 Binance 对当前 IP 的临时封禁，不是程序故障。等状态栏给出的时间后再试，期间不要连续点多个扫描。也可换网络（例如手机热点）。`exchangeInfo` 会缓存约 5 分钟，`ticker/24hr` 约 45 秒，以减少重复请求。
 
-**扫描结果为空？**
+### ClientException: Failed to fetch？
 
-- 确认网络可访问 Binance API。
-- 适当增大 threshold 或 topN。
-- 尝试更常见的周期（15m / 1h）。
+Web 端浏览器直连 Binance 可能被 CORS 或网络拦截。可改用 `flutter run -d windows`，或检查本机能否打开 `https://fapi.binance.com`。
 
-**Android 收不到通知？**
+### 连续扫描为什么不是几秒一次？
 
-- 检查通知权限是否已允许。
-- 检查系统是否对该应用做了省电 / 通知拦截。
-- 可尝试卸载重装后重新授权。
+按任务周期对齐到下一根 K 线收线后再扫。
 
-**threshold 填多少合适？**
+### 顺序浏览没有弹出新标签？
 
-默认 `0.2`（20%）较宽松。若希望更精确的收敛，可尝试 `0.05` ~ `0.15`（5% ~ 15%）。
+浏览器拦截了弹窗。允许本站点弹窗后，再点一次 **开始浏览**。油猴脚本请更新到 v0.4.0。
+
+### 结果弹窗点了开始顺序浏览就消失？
+
+当前版本会保留弹窗，点 **确定** 才关闭。若仍会关掉，请热重启后再试。
+
+---
+
+## 开发说明
+
+| 文件 | 作用 |
+| --- | --- |
+| [`lib/main.dart`](lib/main.dart) | UI、任务、扫描、发行日查询、浏览队列 |
+| [`lib/market/indicators.dart`](lib/market/indicators.dart) | EMA / MA |
+| [`lib/market/post_dense.dart`](lib/market/post_dense.dart) | 密集后趋势 |
+| [`lib/src/binance_viewer_web.dart`](lib/src/binance_viewer_web.dart) | Web 打开 Binance 标签 |
+| [`lib/src/browse_queue_bridge_web.dart`](lib/src/browse_queue_bridge_web.dart) | 把浏览队列写到 `localStorage` |
+| [`tools/tampermonkey/perpscope-binance-browser.user.js`](tools/tampermonkey/perpscope-binance-browser.user.js) | Binance 页内 Prev/Next 与快捷键 |
+
+要点：
+
+- 浏览步进为 **3**。每个币种使用独立窗口名 `perpscope_<index>`，下一组不会覆盖上一组标签。
+- 队列通过 URL hash `#perpscope_queue=` 注入油猴脚本，并同步到 `localStorage` 键 `perpscopeBrowseQueue`。
+- 密度算法：EMA 为首价种子 + 递推（`alpha = 2/(span+1)`），MA 为尾部 span 根简单平均。
+
+---
+
+## 最近更新
+
+### 2026-08-18
+
+- 顺序浏览每次跳 3 个币种，新开标签，不覆盖已打开页面。
+- 结果弹窗点「开始顺序浏览」后仍保留。
+- 「查询发行币种」补齐日期校验、进度/失败提示；418 限流立即失败并显示封禁时间。
+- 常用接口增加短时缓存。
+- 油猴脚本更新至 v0.4.0。
 
 ---
 
 ## 免责声明
 
-本项目仅用于技术研究与策略观察，**不构成任何投资建议**。数字资产交易存在高风险，请自行评估并承担风险。
+本项目仅用于技术研究与策略观察，不构成投资建议。数字资产交易存在高风险，请自行评估并承担风险。

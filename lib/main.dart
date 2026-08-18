@@ -5,13 +5,17 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:flutter/gestures.dart' show TapGestureRecognizer;
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
-import 'package:url_launcher/url_launcher.dart' show launchUrl, LaunchMode;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'web_notifications/web_notification_service_stub.dart'
     if (dart.library.html) 'web_notifications/web_notification_service_web.dart';
+import 'src/browse_queue_bridge_stub.dart'
+    if (dart.library.html) 'src/browse_queue_bridge_web.dart';
+import 'src/binance_viewer_stub.dart'
+    if (dart.library.html) 'src/binance_viewer_web.dart';
 
 class _AlphaTokenInfo {
   final String chainName;
@@ -65,6 +69,24 @@ String formatVolume(double volume) {
   }
 }
 
+const MethodChannel _binanceChannel = MethodChannel('perpscope/binance');
+
+Future<void> _openSymbol(String symbol, String linkMode) async {
+  if (!kIsWeb && Platform.isAndroid) {
+    try {
+      final handled = await _binanceChannel.invokeMethod<bool>('openBinance', {
+        'symbol': symbol,
+        'mode': linkMode,
+      });
+      if (handled == true) return;
+    } catch (e) {
+      // ignore and fallback to web
+    }
+  }
+
+  await openBinanceViewerUrl(binanceFuturesUrl(symbol));
+}
+
 TextSpan boldSymbolSpan(String symbol) => TextSpan(
   text: symbol,
   style: const TextStyle(
@@ -73,10 +95,9 @@ TextSpan boldSymbolSpan(String symbol) => TextSpan(
     decoration: TextDecoration.underline,
   ),
   recognizer: TapGestureRecognizer()
-    ..onTap = () => launchUrl(
-      Uri.parse(binanceFuturesUrl(symbol)),
-      mode: LaunchMode.externalApplication,
-    ),
+    ..onTap = () {
+      _openSymbol(symbol, _EmaScannerPageState._linkMode);
+    },
 );
 
 Widget symbolBoldText(String symbol, String suffix) {
@@ -131,6 +152,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
 
   List<ListingVolumeResult> listingResults = [];
   bool listingSearchRunning = false;
+  List<String> _browseSymbols = const <String>[];
+  int _browseIndex = -1;
+  static const int _browseStep = 3;
 
   static Future<void> _ensureSpotSymbols() async {
     if (_spotSymbols != null || _spotFetching) return;
@@ -221,16 +245,20 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   late TextEditingController _klinesLimitController;
   late TextEditingController _workersController;
   late TextEditingController _newListingDaysController;
+  late TextEditingController _minListingDaysController;
 
   int newListingDays = 550;
+  int minListingDays = 0;
   bool scanOnlyNew = false;
 
   bool _postDenseTrendScanRunning = false;
   bool _postDenseTrendBacktestRunning = false;
+  bool _stableScanRunning = false;
   final List<PostDenseTrendResult> _postDenseTrendResults =
       <PostDenseTrendResult>[];
   final List<PostDenseTrendResult> _postDenseTrendBacktestResults =
       <PostDenseTrendResult>[];
+  final List<StableSymbolResult> _stableSymbolResults = <StableSymbolResult>[];
 
   void _log(String message) {
     debugPrint('[EMA] $message');
@@ -251,6 +279,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     _newListingDaysController = TextEditingController(
       text: newListingDays.toString(),
     );
+    _minListingDaysController = TextEditingController(
+      text: minListingDays.toString(),
+    );
 
     _initNotifications();
     _ensureSpotSymbols();
@@ -264,6 +295,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     _klinesLimitController.dispose();
     _workersController.dispose();
     _newListingDaysController.dispose();
+    _minListingDaysController.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -313,9 +345,171 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       }
       _postDenseTrendResults.clear();
       _postDenseTrendBacktestResults.clear();
+      _stableSymbolResults.clear();
+      listingResults = [];
+      _browseSymbols = const <String>[];
+      _browseIndex = -1;
       _status = '已清空所有任务结果';
     });
+    clearPublishedBrowseQueue();
     _log('已清空所有任务结果');
+  }
+
+  int _parsedMinListingDays() {
+    final v = int.tryParse(_minListingDaysController.text);
+    if (v == null || v < 0) return 0;
+    return v;
+  }
+
+  String _listingDaysFilterLabel(int maxDays, int minDays) {
+    if (minDays > 0 && maxDays > 0) {
+      return '上市${minDays}~${maxDays}天';
+    }
+    if (minDays > 0) return '上市≥${minDays}天';
+    if (maxDays > 0) return '上市≤${maxDays}天';
+    return '不限上市天数';
+  }
+
+  bool _validateListingDaysRange(int maxDays, int minDays) {
+    if (minDays > 0 && maxDays > 0 && minDays > maxDays) {
+      setState(() {
+        _status = '参数不合法：天数>($minDays) 不能大于 天数≤($maxDays)';
+      });
+      return false;
+    }
+    return true;
+  }
+
+  List<String> _buildBrowseSymbolsFromCurrentResults() {
+    final symbols = <String>[];
+    final seen = <String>{};
+
+    void addSymbol(String symbol) {
+      if (symbol.isEmpty || !seen.add(symbol)) return;
+      symbols.add(symbol);
+    }
+
+    final trendUp = _sortedTrendResults(_postDenseTrendResults, 'up');
+    final backtestUp = _sortedTrendResults(_postDenseTrendBacktestResults, 'up');
+
+    for (final item in trendUp) {
+      addSymbol(item.symbol);
+    }
+    for (final item in backtestUp) {
+      addSymbol(item.symbol);
+    }
+    for (final item in _stableSymbolResults) {
+      addSymbol(item.symbol);
+    }
+    for (final task in _tasks) {
+      for (final match in task.matches) {
+        addSymbol(match.symbol);
+      }
+    }
+    for (final item in listingResults) {
+      addSymbol(item.symbol);
+    }
+
+    return symbols;
+  }
+
+  void _publishBrowseQueue() {
+    if (!kIsWeb) return;
+    final symbols = _browseSymbols;
+    final urls = symbols.map(binanceFuturesUrl).toList(growable: false);
+    final currentIndex =
+        symbols.isEmpty ? -1 : _browseIndex.clamp(0, symbols.length - 1);
+    publishBrowseQueue({
+      'symbols': symbols,
+      'urls': urls,
+      'currentIndex': currentIndex,
+      'linkMode': _linkMode,
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    });
+  }
+
+  Future<void> _openBrowseIndex(int index) async {
+    if (_browseSymbols.isEmpty || index < 0 || index >= _browseSymbols.length) {
+      return;
+    }
+    final symbol = _browseSymbols[index];
+    if (!mounted) return;
+    final batchEnd = math.min(_browseSymbols.length, index + _browseStep);
+    setState(() {
+      _browseIndex = index;
+      _status =
+          '顺序浏览 ${index + 1}-$batchEnd/${_browseSymbols.length}: $symbol';
+    });
+    _publishBrowseQueue();
+
+    final payload = kIsWeb
+        ? Uri.encodeComponent(
+            jsonEncode({
+              'symbols': _browseSymbols,
+              'urls': _browseSymbols
+                  .map(binanceFuturesUrl)
+                  .toList(growable: false),
+              'currentIndex': index,
+              'linkMode': _linkMode,
+              'updatedAt': DateTime.now().toUtc().toIso8601String(),
+            }),
+          )
+        : null;
+
+    for (var i = index; i < batchEnd; i++) {
+      final itemSymbol = _browseSymbols[i];
+      var url = binanceFuturesUrl(itemSymbol);
+      if (payload != null && i == index) {
+        url = '$url#perpscope_queue=$payload';
+      }
+      await openBinanceViewerUrl(
+        url,
+        targetName: 'perpscope_$i',
+      );
+    }
+  }
+
+  Future<void> _startBrowseCurrentResults() async {
+    final symbols = _buildBrowseSymbolsFromCurrentResults();
+    await _startBrowseWithSymbols(symbols);
+  }
+
+  Future<void> _startBrowseWithSymbols(Iterable<String> symbols) async {
+    final uniqueSymbols = <String>[];
+    final seen = <String>{};
+    for (final symbol in symbols) {
+      if (symbol.isEmpty || !seen.add(symbol)) continue;
+      uniqueSymbols.add(symbol);
+    }
+    if (uniqueSymbols.isEmpty) {
+      setState(() {
+        _status = '没有可浏览的结果';
+      });
+      return;
+    }
+
+    setState(() {
+      _browseSymbols = uniqueSymbols;
+      _browseIndex = 0;
+    });
+    _publishBrowseQueue();
+    await _openBrowseIndex(0);
+  }
+
+  Future<void> _browsePrev() async {
+    if (_browseSymbols.isEmpty) return;
+    final nextIndex = _browseIndex <= 0
+        ? 0
+        : math.max(0, _browseIndex - _browseStep);
+    await _openBrowseIndex(nextIndex);
+  }
+
+  Future<void> _browseNext() async {
+    if (_browseSymbols.isEmpty) return;
+    final nextIndex = _browseIndex < 0
+        ? 0
+        : math.min(_browseSymbols.length - 1, _browseIndex + _browseStep);
+    await _openBrowseIndex(nextIndex);
   }
 
   void _addTask() {
@@ -396,6 +590,12 @@ class _EmaScannerPageState extends State<EmaScannerPage>
             ),
           ),
           actions: [
+            TextButton(
+              onPressed: () async {
+                await _startBrowseWithSymbols(matches.map((m) => m.symbol));
+              },
+              child: const Text('开始顺序浏览'),
+            ),
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
               child: const Text('确定'),
@@ -647,6 +847,12 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           ),
           actions: [
             TextButton(
+              onPressed: () async {
+                await _startBrowseWithSymbols(results.map((r) => r.symbol));
+              },
+              child: const Text('开始顺序浏览'),
+            ),
+            TextButton(
               onPressed: () => Navigator.of(context).pop(),
               child: const Text('确定'),
             ),
@@ -659,33 +865,43 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   Future<void> _showListingRangeDialog(
     List<ListingVolumeResult> results,
   ) async {
+    if (!mounted) return;
+
     await showDialog(
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: const Text('指定时间发行币种'),
+          title: Text('指定时间发行币种 (${results.length})'),
 
           content: SizedBox(
             width: 400,
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: results.map((r) {
-                  return Text.rich(
-                    TextSpan(
-                      children: [
-                        boldSymbolSpan(r.symbol),
-
-                        TextSpan(text: '  ${formatVolume(r.quoteVolume)}'),
-                      ],
-                    ),
-                  );
-                }).toList(),
-              ),
-            ),
+            height: results.isEmpty ? null : 360,
+            child: results.isEmpty
+                ? const Text('该时间范围内没有符合条件的 USDT 永续合约')
+                : ListView.builder(
+                    shrinkWrap: results.length <= 8,
+                    itemCount: results.length,
+                    itemBuilder: (context, index) {
+                      final r = results[index];
+                      return Text.rich(
+                        TextSpan(
+                          children: [
+                            boldSymbolSpan(r.symbol),
+                            TextSpan(text: '  ${formatVolume(r.quoteVolume)}'),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
           ),
 
           actions: [
+            TextButton(
+              onPressed: () async {
+                await _startBrowseWithSymbols(results.map((r) => r.symbol));
+              },
+              child: const Text('开始顺序浏览'),
+            ),
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
               child: const Text('确定'),
@@ -705,6 +921,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     final parsedWorkers = int.tryParse(_workersController.text);
     final parsedDays =
         int.tryParse(_newListingDaysController.text) ?? newListingDays;
+    final parsedMinDays = _parsedMinListingDays();
 
     if (parsedTopN == null ||
         parsedTopN <= 0 ||
@@ -717,39 +934,42 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         parsedDays <= 0) {
       setState(() {
         _status =
-            '参数不合法，请检查 topN、threshold、klinesLimit（>=121）、workers（>0）、天数（>0）';
+            '参数不合法，请检查 topN、threshold、klinesLimit（>=121）、workers（>0）、天数≤（>0）';
       });
       return;
     }
+    if (!_validateListingDaysRange(parsedDays, parsedMinDays)) return;
 
     topN = parsedTopN;
     threshold = parsedThreshold;
     klinesLimit = parsedKlinesLimit;
     workers = parsedWorkers;
     newListingDays = parsedDays;
+    minListingDays = parsedMinDays;
 
     setState(() {
       _postDenseTrendScanRunning = true;
       _postDenseTrendResults.clear();
       _status =
-          '扫描密集后持续方向(周期 $interval, 上市≤${parsedDays}天, topN=$parsedTopN) ...';
+          '扫描密集后上升趋势(周期 $interval, ${_listingDaysFilterLabel(parsedDays, parsedMinDays)}, topN=$parsedTopN) ...';
     });
     _log(
-      '开始扫描密集后持续方向: interval=$interval topN=$parsedTopN threshold=$parsedThreshold '
-      'klinesLimit=$klinesLimit workers=$workers maxListingDays=$parsedDays',
+      '开始扫描密集后上升趋势: interval=$interval topN=$parsedTopN threshold=$parsedThreshold '
+      'klinesLimit=$klinesLimit workers=$workers maxListingDays=$parsedDays minListingDays=$parsedMinDays',
     );
 
     try {
       final symbols = await fetchTopSymbolsByQuoteVolume(
         parsedTopN,
         maxListingDays: parsedDays,
+        minListingDays: parsedMinDays,
       );
 
       if (symbols.isEmpty) {
         setState(() {
           _status = '未获取到任何 symbol';
         });
-        _log('密集后持续方向扫描：未获取到任何 symbol');
+        _log('密集后上升趋势扫描：未获取到任何 symbol');
         return;
       }
 
@@ -771,7 +991,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
 
           final trend = detectPostDenseTrend(bars, threshold: parsedThreshold);
           if (trend == null) {
-            _log('[$localIdx/$total] $symbol 不满足密集后持续方向');
+            _log('[$localIdx/$total] $symbol 不满足密集后上升趋势');
             return null;
           }
 
@@ -810,7 +1030,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         }
         if (mounted) {
           setState(() {
-            _status = '扫描密集后持续方向 [$idx/$total]，已找到 ${matches.length} 个';
+            _status = '扫描密集后上升趋势 [$idx/$total]，已找到 ${matches.length} 个';
           });
         }
         i = end;
@@ -822,9 +1042,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       setState(() {
         _postDenseTrendResults.addAll(matches);
         _status =
-            '密集后持续方向扫描完成，共找到 ${matches.length} 个 (周期 $interval, 上市≤${parsedDays}天)';
+            '密集后上升趋势扫描完成，共找到 ${matches.length} 个 (周期 $interval, ${_listingDaysFilterLabel(parsedDays, parsedMinDays)})';
       });
-      _log('密集后持续方向扫描完成，匹配数量: ${matches.length}');
+      _log('密集后上升趋势扫描完成，匹配数量: ${matches.length}');
 
       if (matches.isNotEmpty) {
         await _showPostDenseTrendDialog(matches);
@@ -833,7 +1053,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           context: context,
           builder: (context) {
             return AlertDialog(
-              title: Text('密集后持续方向 (周期 $interval, 上市≤${parsedDays}天)'),
+              title: Text(
+                '密集后上升趋势 (周期 $interval, ${_listingDaysFilterLabel(parsedDays, parsedMinDays)})',
+              ),
               content: const Text('未发现满足条件的币种。'),
               actions: [
                 TextButton(
@@ -848,10 +1070,10 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     } catch (e) {
       if (mounted) {
         setState(() {
-          _status = '密集后持续方向扫描失败: $e';
+          _status = '密集后上升趋势扫描失败: $e';
         });
       }
-      _log('密集后持续方向扫描失败: $e');
+      _log('密集后上升趋势扫描失败: $e');
     } finally {
       if (mounted) {
         setState(() {
@@ -870,6 +1092,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     final parsedWorkers = int.tryParse(_workersController.text);
     final parsedDays =
         int.tryParse(_newListingDaysController.text) ?? newListingDays;
+    final parsedMinDays = _parsedMinListingDays();
 
     if (parsedTopN == null ||
         parsedTopN <= 0 ||
@@ -882,32 +1105,35 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         parsedDays <= 0) {
       setState(() {
         _status =
-            '参数不合法，请检查 topN、threshold、klinesLimit（>=121）、workers（>0）、天数（>0）';
+            '参数不合法，请检查 topN、threshold、klinesLimit（>=121）、workers（>0）、天数≤（>0）';
       });
       return;
     }
+    if (!_validateListingDaysRange(parsedDays, parsedMinDays)) return;
 
     topN = parsedTopN;
     threshold = parsedThreshold;
     klinesLimit = parsedKlinesLimit;
     workers = parsedWorkers;
     newListingDays = parsedDays;
+    minListingDays = parsedMinDays;
 
     setState(() {
       _postDenseTrendBacktestRunning = true;
       _postDenseTrendBacktestResults.clear();
       _status =
-          '回测密集后持续方向(周期 $interval, 上市≤${parsedDays}天, topN=$parsedTopN) ...';
+          '回测密集后上升趋势(周期 $interval, ${_listingDaysFilterLabel(parsedDays, parsedMinDays)}, topN=$parsedTopN) ...';
     });
     _log(
-      '开始回测密集后持续方向: interval=$interval topN=$parsedTopN threshold=$parsedThreshold '
-      'klinesLimit=$klinesLimit workers=$workers maxListingDays=$parsedDays',
+      '开始回测密集后上升趋势: interval=$interval topN=$parsedTopN threshold=$parsedThreshold '
+      'klinesLimit=$klinesLimit workers=$workers maxListingDays=$parsedDays minListingDays=$parsedMinDays',
     );
 
     try {
       final symbols = await fetchTopSymbolsByQuoteVolume(
         parsedTopN,
         maxListingDays: parsedDays,
+        minListingDays: parsedMinDays,
       );
 
       if (symbols.isEmpty) {
@@ -968,7 +1194,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         }
         if (mounted) {
           setState(() {
-            _status = '回测密集后持续方向 [$idx/$total]，已找到 ${matches.length} 段';
+            _status = '回测密集后上升趋势 [$idx/$total]，已找到 ${matches.length} 段';
           });
         }
         i = end;
@@ -984,9 +1210,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       setState(() {
         _postDenseTrendBacktestResults.addAll(matches);
         _status =
-            '回测完成，共 ${matches.length} 段 (周期 $interval, 上市≤${parsedDays}天)';
+            '回测完成，共 ${matches.length} 段 (周期 $interval, ${_listingDaysFilterLabel(parsedDays, parsedMinDays)})';
       });
-      _log('回测密集后持续方向完成，段数: ${matches.length}');
+      _log('回测密集后上升趋势完成，段数: ${matches.length}');
 
       if (matches.isNotEmpty) {
         await _showPostDenseTrendBacktestDialog(matches);
@@ -995,7 +1221,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           context: context,
           builder: (context) {
             return AlertDialog(
-              title: Text('回测密集后持续方向 (周期 $interval, 上市≤${parsedDays}天)'),
+              title: Text(
+                '回测密集后上升趋势 (周期 $interval, ${_listingDaysFilterLabel(parsedDays, parsedMinDays)})',
+              ),
               content: const Text('未发现符合模型的历史时间段。'),
               actions: [
                 TextButton(
@@ -1010,10 +1238,10 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     } catch (e) {
       if (mounted) {
         setState(() {
-          _status = '回测密集后持续方向失败: $e';
+          _status = '回测密集后上升趋势失败: $e';
         });
       }
-      _log('回测密集后持续方向失败: $e');
+      _log('回测密集后上升趋势失败: $e');
     } finally {
       if (mounted) {
         setState(() {
@@ -1029,7 +1257,6 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     if (!mounted || results.isEmpty) return;
 
     final upResults = _sortedTrendResults(results, 'up');
-    final downResults = _sortedTrendResults(results, 'down');
 
     Widget buildResultRow(PostDenseTrendResult m) {
       return Padding(
@@ -1071,7 +1298,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: Text('密集后持续方向 (周期 $interval, 共 ${results.length} 个)'),
+          title: Text('密集后上升趋势 (周期 $interval, 共 ${results.length} 个)'),
           content: SizedBox(
             width: 360,
             child: SingleChildScrollView(
@@ -1079,12 +1306,17 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   buildSection('— ↑ 上涨 (${upResults.length}) —', upResults),
-                  buildSection('— ↓ 下跌 (${downResults.length}) —', downResults),
                 ],
               ),
             ),
           ),
           actions: [
+            TextButton(
+              onPressed: () async {
+                await _startBrowseWithSymbols(results.map((m) => m.symbol));
+              },
+              child: const Text('开始顺序浏览'),
+            ),
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
               child: const Text('确定'),
@@ -1127,7 +1359,6 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     if (!mounted || results.isEmpty) return;
 
     final upResults = _sortedTrendResults(results, 'up');
-    final downResults = _sortedTrendResults(results, 'down');
 
     Widget buildResultRow(PostDenseTrendResult m) {
       return Padding(
@@ -1169,7 +1400,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: Text('回测密集后持续方向 (周期 $interval, 共 ${results.length} 段)'),
+          title: Text('回测密集后上升趋势 (周期 $interval, 共 ${results.length} 段)'),
           content: SizedBox(
             width: 400,
             child: SingleChildScrollView(
@@ -1177,18 +1408,23 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    '回测逻辑：密集区判叉 → 沿 MA20+EMA20 顺势；'
+                    '回测逻辑：密集区金叉 → 沿 MA20+EMA20 上升；'
                     '趋势 >10 根后破势则截段（含破势前最后一根）。',
                     style: TextStyle(fontSize: 12, color: Colors.grey),
                   ),
                   const SizedBox(height: 12),
                   buildSection('— ↑ 上涨 (${upResults.length}) —', upResults),
-                  buildSection('— ↓ 下跌 (${downResults.length}) —', downResults),
                 ],
               ),
             ),
           ),
           actions: [
+            TextButton(
+              onPressed: () async {
+                await _startBrowseWithSymbols(results.map((m) => m.symbol));
+              },
+              child: const Text('开始顺序浏览'),
+            ),
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
               child: const Text('确定'),
@@ -1234,6 +1470,12 @@ class _EmaScannerPageState extends State<EmaScannerPage>
             ),
           ),
           actions: [
+            TextButton(
+              onPressed: () async {
+                await _startBrowseWithSymbols(results.map((r) => r.symbol));
+              },
+              child: const Text('开始顺序浏览'),
+            ),
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
               child: const Text('确定'),
@@ -1373,9 +1615,11 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         _log('任务 #${task.id} 开始新一轮扫描');
         final parsedListingDays =
             int.tryParse(_newListingDaysController.text) ?? newListingDays;
+        final parsedMinListingDays = _parsedMinListingDays();
         final symbols = await fetchTopSymbolsByQuoteVolume(
           topN,
           maxListingDays: parsedListingDays,
+          minListingDays: parsedMinListingDays,
         );
         if (symbols.isEmpty) {
           setState(() {
@@ -1611,13 +1855,283 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     }
   }
 
+  Future<void> _scanStableSymbols() async {
+    if (_stableScanRunning) return;
+
+    final parsedTopN = int.tryParse(_topNController.text);
+    final parsedWorkers = int.tryParse(_workersController.text);
+    final parsedDays =
+        int.tryParse(_newListingDaysController.text) ?? newListingDays;
+    final parsedMinDays = _parsedMinListingDays();
+
+    if (parsedTopN == null ||
+        parsedTopN <= 0 ||
+        parsedWorkers == null ||
+        parsedWorkers <= 0 ||
+        parsedDays <= 0) {
+      setState(() {
+        _status = '参数不合法，请检查 topN、workers（>0）、天数≤（>0）';
+      });
+      return;
+    }
+    if (!_validateListingDaysRange(parsedDays, parsedMinDays)) return;
+
+    topN = parsedTopN;
+    workers = parsedWorkers;
+    newListingDays = parsedDays;
+    minListingDays = parsedMinDays;
+
+    setState(() {
+      _stableScanRunning = true;
+      _stableSymbolResults.clear();
+      _status =
+          '扫描稳定币种(${_listingDaysFilterLabel(parsedDays, parsedMinDays)}, topN=$parsedTopN, 波动<${stableMaxRangeMultiple.toInt()}倍) ...';
+    });
+    _log(
+      '开始扫描稳定币种: topN=$parsedTopN maxListingDays=$parsedDays '
+      'minListingDays=$parsedMinDays workers=$workers maxRangeMultiple=$stableMaxRangeMultiple',
+    );
+
+    try {
+      final listingTimes = await fetchUsdtPerpListingTimesMs();
+      final symbols = await fetchTopSymbolsByQuoteVolume(
+        parsedTopN,
+        maxListingDays: parsedDays,
+        minListingDays: parsedMinDays,
+      );
+
+      if (symbols.isEmpty) {
+        setState(() {
+          _status = '稳定币种扫描：未获取到任何 symbol';
+        });
+        return;
+      }
+
+      final tickers = await fetchBinanceTicker24hr() as dynamic;
+      final vol24h = <String, double>{};
+      if (tickers is List) {
+        for (final t in tickers) {
+          if (t is! Map<String, dynamic>) continue;
+          final sym = (t['symbol'] ?? '').toString();
+          vol24h[sym] =
+              double.tryParse((t['quoteVolume'] ?? '0').toString()) ?? 0.0;
+        }
+      }
+
+      final stable = <StableSymbolResult>[];
+      final total = symbols.length;
+      var idx = 0;
+
+      Future<StableSymbolResult?> worker(int localIdx, String symbol) async {
+        try {
+          final listedAtMs = listingTimes[symbol];
+          if (listedAtMs == null) {
+            _log('[$localIdx/$total] $symbol 跳过(无上市时间)');
+            return null;
+          }
+
+          final range = await fetchLifetimePriceRange(symbol, listedAtMs);
+          if (range == null) {
+            _log('[$localIdx/$total] $symbol 跳过(价格区间数据不足)');
+            return null;
+          }
+
+          if (!range.isStable(maxMultiple: stableMaxRangeMultiple)) {
+            _log(
+              '[$localIdx/$total] $symbol 非稳定 '
+              '低点=${range.minLow} 高点=${range.maxHigh} '
+              '倍数=${range.rangeMultiple.toStringAsFixed(2)}',
+            );
+            return null;
+          }
+
+          final result = StableSymbolResult(
+            symbol: symbol,
+            listedAt: DateTime.fromMillisecondsSinceEpoch(
+              listedAtMs,
+              isUtc: true,
+            ),
+            minLow: range.minLow,
+            maxHigh: range.maxHigh,
+            rangeMultiple: range.rangeMultiple,
+            quoteVolume24h: vol24h[symbol] ?? 0.0,
+            dailyBarsUsed: range.barCount,
+          );
+          _log(
+            '[$localIdx/$total] $symbol 稳定 '
+            '倍数=${result.rangeMultiple.toStringAsFixed(2)} '
+            '24h额=${formatVolume(result.quoteVolume24h)}',
+          );
+          return result;
+        } catch (e) {
+          _log('[$localIdx/$total] $symbol 稳定扫描失败: $e');
+          return null;
+        }
+      }
+
+      var i = 0;
+      while (i < total) {
+        final end = (i + workers) > total ? total : (i + workers);
+        final batch = symbols.sublist(i, end);
+        final futures = <Future<StableSymbolResult?>>[];
+        for (final symbol in batch) {
+          idx += 1;
+          futures.add(worker(idx, symbol));
+        }
+        final batchResults = await Future.wait(futures);
+        for (final r in batchResults) {
+          if (r != null) stable.add(r);
+        }
+        if (mounted) {
+          setState(() {
+            _status =
+                '扫描稳定币种 [$idx/$total]，已找到 ${stable.length} 个 (波动<${stableMaxRangeMultiple.toInt()}倍)';
+          });
+        }
+        i = end;
+      }
+
+      stable.sort((a, b) {
+        final byRange = a.rangeMultiple.compareTo(b.rangeMultiple);
+        if (byRange != 0) return byRange;
+        return b.quoteVolume24h.compareTo(a.quoteVolume24h);
+      });
+
+      if (!mounted) return;
+      setState(() {
+        _stableSymbolResults.addAll(stable);
+        _status =
+            '稳定币种扫描完成，共 ${stable.length}/${total} 个 (${_listingDaysFilterLabel(parsedDays, parsedMinDays)}, topN=$parsedTopN)';
+      });
+      _log('稳定币种扫描完成，匹配 ${stable.length}/${total}');
+
+      if (stable.isNotEmpty) {
+        await _showStableSymbolsDialog(
+          stable,
+          parsedDays,
+          parsedMinDays,
+          parsedTopN,
+        );
+      } else {
+        await showDialog<void>(
+          context: context,
+          builder: (context) {
+            return AlertDialog(
+              title: Text(
+                '稳定币种 (${_listingDaysFilterLabel(parsedDays, parsedMinDays)}, top $parsedTopN)',
+              ),
+              content: Text(
+                '在 ${total} 个候选中，未发现自上市以来高低点倍数低于 '
+                '${stableMaxRangeMultiple.toInt()} 倍的币种。',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('确定'),
+                ),
+              ],
+            );
+          },
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _status = '稳定币种扫描失败: $e';
+        });
+      }
+      _log('稳定币种扫描失败: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _stableScanRunning = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _showStableSymbolsDialog(
+    List<StableSymbolResult> results,
+    int maxListingDays,
+    int minListingDays,
+    int topN,
+  ) async {
+    if (!mounted || results.isEmpty) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(
+            '稳定币种 (${_listingDaysFilterLabel(maxListingDays, minListingDays)}, top $topN, 共 ${results.length} 个)',
+          ),
+          content: SizedBox(
+            width: 400,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '稳定定义：自上市以来日线最低价→最高价倍数 < '
+                    '${stableMaxRangeMultiple.toInt()}（无百倍级单边波动）。',
+                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 12),
+                  ...results.map((r) {
+                    final d = r.listedAt.toUtc();
+                    final date =
+                        '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text.rich(
+                        TextSpan(
+                          children: [
+                            boldSymbolSpan(r.symbol),
+                            TextSpan(
+                              text:
+                                  '  $date\n'
+                                  '低点→高点=${r.rangeMultiple.toStringAsFixed(2)}倍  '
+                                  '低=${r.minLow.toStringAsFixed(6)}  '
+                                  '高=${r.maxHigh.toStringAsFixed(6)}  '
+                                  '24h额=${formatVolume(r.quoteVolume24h)}',
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  }),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Future<void> _searchListings() async {
     if (listingStartDate == null || listingEndDate == null) {
+      setState(() {
+        _status = '请先选择起始日期和终止日期';
+      });
+      return;
+    }
+    if (listingStartDate!.isAfter(listingEndDate!)) {
+      setState(() {
+        _status = '起始日期不能晚于终止日期';
+      });
       return;
     }
 
     setState(() {
       listingSearchRunning = true;
+      _status = '查询发行币种中...';
     });
 
     try {
@@ -1626,14 +2140,24 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         endDate: listingEndDate!,
       );
 
+      if (!mounted) return;
       setState(() {
         listingResults = result;
+        _status = '查询完成，共 ${result.length} 个币种';
       });
       await _showListingRangeDialog(result);
-    } finally {
+    } catch (e) {
+      if (!mounted) return;
       setState(() {
-        listingSearchRunning = false;
+        _status = '查询发行币种失败: $e';
       });
+      _log('查询发行币种失败: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          listingSearchRunning = false;
+        });
+      }
     }
   }
 
@@ -1643,17 +2167,19 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     const double resultPanelHeight = 720;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('PerpScope')),
+      appBar: AppBar(
+        title: const Text('PerpScope'),
+      ),
       body: LayoutBuilder(
-        builder: (context, constraints) {
-          return SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: ConstrainedBox(
-              constraints: BoxConstraints(
-                minHeight: constraints.maxHeight - 32,
-              ),
-              child: Column(
-                children: [
+          builder: (context, constraints) {
+            return SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  minHeight: constraints.maxHeight - 32,
+                ),
+                child: Column(
+                  children: [
                   Card(
                     elevation: 2,
                     child: Padding(
@@ -1773,8 +2299,22 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                         decimal: false,
                                       ),
                                   decoration: const InputDecoration(
-                                    labelText: '天数',
+                                    labelText: '天数≤',
                                     hintText: '上市不超过，例如 550',
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: TextField(
+                                  controller: _minListingDaysController,
+                                  keyboardType:
+                                      const TextInputType.numberWithOptions(
+                                        decimal: false,
+                                      ),
+                                  decoration: const InputDecoration(
+                                    labelText: '天数>',
+                                    hintText: '发行天数大于，0=不限',
                                   ),
                                 ),
                               ),
@@ -1810,6 +2350,23 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                 child: OutlinedButton(
                                   onPressed: _scanNewListingsByLifetimeVolume,
                                   child: const Text('扫描新币(全时成交额排序)'),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Flexible(
+                                fit: FlexFit.loose,
+                                child: OutlinedButton(
+                                  onPressed:
+                                      _stableScanRunning ? null : _scanStableSymbols,
+                                  child: Text(
+                                    _stableScanRunning
+                                        ? '扫描稳定币种...'
+                                        : '扫描稳定币种(<100倍波动)',
+                                  ),
                                 ),
                               ),
                             ],
@@ -1895,8 +2452,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                       : _scanPostDenseTrend,
                                   child: Text(
                                     _postDenseTrendScanRunning
-                                        ? '扫描密集后持续方向...'
-                                        : '扫描密集后持续方向',
+                                        ? '扫描密集后上升趋势...'
+                                        : '扫描密集后上升趋势',
                                   ),
                                 ),
                               ),
@@ -1915,8 +2472,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                       : _backtestPostDenseTrend,
                                   child: Text(
                                     _postDenseTrendBacktestRunning
-                                        ? '回测密集后持续方向...'
-                                        : '回测密集后持续方向',
+                                        ? '回测密集后上升趋势...'
+                                        : '回测密集后上升趋势',
                                   ),
                                 ),
                               ),
@@ -1963,6 +2520,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                   setState(() {
                                     _linkMode = v;
                                   });
+                                  _publishBrowseQueue();
                                   if (v == 'spot_alpha') {
                                     _ensureSpotSymbols();
                                     _ensureAlphaTokens();
@@ -2050,6 +2608,52 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                     ),
                   ),
                   const SizedBox(height: 8),
+                  Card(
+                    elevation: 1,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      child: Row(
+                        children: [
+                          ElevatedButton(
+                            onPressed: _startBrowseCurrentResults,
+                            child: const Text('开始浏览'),
+                          ),
+                          const SizedBox(width: 8),
+                          OutlinedButton(
+                            onPressed:
+                                _browseSymbols.isEmpty ? null : _browsePrev,
+                            child: const Text('上一个(-3)'),
+                          ),
+                          const SizedBox(width: 8),
+                          OutlinedButton(
+                            onPressed:
+                                _browseSymbols.isEmpty ? null : _browseNext,
+                            child: const Text('下一个(+3)'),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              _browseSymbols.isEmpty
+                                  ? '当前没有浏览队列'
+                                  : '浏览队列 ${_browseIndex >= 0 ? _browseIndex + 1 : 0}/${_browseSymbols.length}'
+                                      '  ${_browseIndex >= 0 ? _browseSymbols[_browseIndex] : ''}',
+                              style: const TextStyle(fontSize: 12),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          const Text(
+                            '需安装 Tampermonkey；快捷键每次跳 3 个: [ ] / ← → / J K',
+                            style: TextStyle(fontSize: 12, color: Colors.grey),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
                   SizedBox(
                     height: resultPanelHeight,
                     child: Card(
@@ -2065,23 +2669,19 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                           final hasTrend = _postDenseTrendResults.isNotEmpty;
                           final hasBacktest =
                               _postDenseTrendBacktestResults.isNotEmpty;
+                          final hasStable = _stableSymbolResults.isNotEmpty;
                           final trendUp = _sortedTrendResults(
                             _postDenseTrendResults,
                             'up',
-                          );
-                          final trendDown = _sortedTrendResults(
-                            _postDenseTrendResults,
-                            'down',
                           );
                           final backtestUp = _sortedTrendResults(
                             _postDenseTrendBacktestResults,
                             'up',
                           );
-                          final backtestDown = _sortedTrendResults(
-                            _postDenseTrendBacktestResults,
-                            'down',
-                          );
-                          if (entries.isEmpty && !hasTrend && !hasBacktest) {
+                          if (entries.isEmpty &&
+                              !hasTrend &&
+                              !hasBacktest &&
+                              !hasStable) {
                             return const Center(
                               child: Text(
                                 '暂无匹配结果',
@@ -2091,14 +2691,11 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                           }
                           final itemCount =
                               (trendUp.isNotEmpty ? 1 + trendUp.length : 0) +
-                              (trendDown.isNotEmpty
-                                  ? 1 + trendDown.length
-                                  : 0) +
                               (backtestUp.isNotEmpty
                                   ? 1 + backtestUp.length
                                   : 0) +
-                              (backtestDown.isNotEmpty
-                                  ? 1 + backtestDown.length
+                              (hasStable
+                                  ? 1 + _stableSymbolResults.length
                                   : 0) +
                               (entries.isNotEmpty ? 1 + entries.length : 0);
                           return ListView.builder(
@@ -2127,27 +2724,6 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                 cursor += trendUp.length;
                               }
 
-                              if (trendDown.isNotEmpty) {
-                                if (index == cursor) {
-                                  return ListTile(
-                                    title: Text(
-                                      '— ↓ 下跌 (${trendDown.length}) —',
-                                      style: const TextStyle(
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  );
-                                }
-                                cursor += 1;
-                                final downIdx = index - cursor;
-                                if (downIdx < trendDown.length) {
-                                  return _postDenseTrendListTile(
-                                    trendDown[downIdx],
-                                  );
-                                }
-                                cursor += trendDown.length;
-                              }
-
                               if (backtestUp.isNotEmpty) {
                                 if (index == cursor) {
                                   return ListTile(
@@ -2170,11 +2746,11 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                 cursor += backtestUp.length;
                               }
 
-                              if (backtestDown.isNotEmpty) {
+                              if (hasStable) {
                                 if (index == cursor) {
                                   return ListTile(
                                     title: Text(
-                                      '— 回测 ↓ 下跌 (${backtestDown.length}) —',
+                                      '— 稳定币种 (${_stableSymbolResults.length}) —',
                                       style: const TextStyle(
                                         fontWeight: FontWeight.bold,
                                       ),
@@ -2182,14 +2758,23 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                   );
                                 }
                                 cursor += 1;
-                                final downIdx = index - cursor;
-                                if (downIdx < backtestDown.length) {
-                                  return _postDenseTrendListTile(
-                                    backtestDown[downIdx],
-                                    backtest: true,
+                                final stableIdx = index - cursor;
+                                if (stableIdx < _stableSymbolResults.length) {
+                                  final s = _stableSymbolResults[stableIdx];
+                                  return ListTile(
+                                    title: symbolBoldText(
+                                      s.symbol,
+                                      '  (${s.rangeMultiple.toStringAsFixed(2)}倍)',
+                                    ),
+                                    subtitle: Text(
+                                      '上市 ${formatUtcDate(s.listedAt)}  '
+                                      '低=${s.minLow.toStringAsFixed(6)}  '
+                                      '高=${s.maxHigh.toStringAsFixed(6)}  '
+                                      '24h额=${formatVolume(s.quoteVolume24h)}',
+                                    ),
                                   );
                                 }
-                                cursor += backtestDown.length;
+                                cursor += _stableSymbolResults.length;
                               }
 
                               if (entries.isNotEmpty) {
@@ -2269,15 +2854,88 @@ class _TaskMatchEntry {
   _TaskMatchEntry(this.interval, this.match);
 }
 
+// 自上市以来高低点倍数低于此值视为「稳定」（无百倍级单边波动）。
+const double stableMaxRangeMultiple = 100.0;
+
 // 直接访问 Binance USDT 永续合约接口，对应 Python 代码中的 BINANCE_FAPI_BASE。
 const String binanceFapiBase = 'https://fapi.binance.com';
 const int binanceKlinesMaxLimit = 1500;
+
+dynamic _cachedExchangeInfo;
+DateTime? _cachedExchangeInfoAt;
+dynamic _cachedTicker24hr;
+DateTime? _cachedTicker24hrAt;
+
+const Duration _exchangeInfoCacheTtl = Duration(minutes: 5);
+const Duration _ticker24hrCacheTtl = Duration(seconds: 45);
+
+Future<dynamic> fetchBinanceExchangeInfo({bool forceRefresh = false}) async {
+  final now = DateTime.now();
+  if (!forceRefresh &&
+      _cachedExchangeInfo != null &&
+      _cachedExchangeInfoAt != null &&
+      now.difference(_cachedExchangeInfoAt!) < _exchangeInfoCacheTtl) {
+    return _cachedExchangeInfo;
+  }
+  final data =
+      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo');
+  _cachedExchangeInfo = data;
+  _cachedExchangeInfoAt = now;
+  return data;
+}
+
+Future<dynamic> fetchBinanceTicker24hr({bool forceRefresh = false}) async {
+  final now = DateTime.now();
+  if (!forceRefresh &&
+      _cachedTicker24hr != null &&
+      _cachedTicker24hrAt != null &&
+      now.difference(_cachedTicker24hrAt!) < _ticker24hrCacheTtl) {
+    return _cachedTicker24hr;
+  }
+  final data = await httpGetJson('$binanceFapiBase/fapi/v1/ticker/24hr');
+  _cachedTicker24hr = data;
+  _cachedTicker24hrAt = now;
+  return data;
+}
+
+String? _tryParseBinanceBanMessage(String body, int statusCode) {
+  try {
+    final decoded = jsonDecode(body);
+    if (decoded is! Map) return null;
+    final msg = decoded['msg']?.toString() ?? '';
+    final code = decoded['code'];
+    final isRateLimit = code == -1003 ||
+        msg.toLowerCase().contains('too many requests') ||
+        msg.contains('banned until');
+    if (!isRateLimit && msg.isEmpty) return null;
+
+    final match = RegExp(r'banned until (\d+)').firstMatch(msg);
+    if (match != null) {
+      final untilMs = int.tryParse(match.group(1)!);
+      if (untilMs != null) {
+        final until =
+            DateTime.fromMillisecondsSinceEpoch(untilMs, isUtc: true).toLocal();
+        final wait = until.difference(DateTime.now());
+        if (!wait.isNegative) {
+          final mins = wait.inMinutes;
+          final secs = wait.inSeconds.remainder(60);
+          return 'Binance API 请求过多，IP 已被限流至 $until（约 ${mins}分${secs}秒后可重试）';
+        }
+      }
+    }
+
+    if (msg.isNotEmpty) {
+      return 'Binance API 请求过多 (HTTP $statusCode): $msg';
+    }
+  } catch (_) {}
+  return null;
+}
 
 Future<dynamic> httpGetJson(
   String url, {
   Map<String, String>? params,
   int timeoutSeconds = 15,
-  int maxRetries = 3,
+  int maxRetries = 6,
 }) async {
   var uri = Uri.parse(url);
   if (params != null && params.isNotEmpty) {
@@ -2301,10 +2959,8 @@ Future<dynamic> httpGetJson(
             .timeout(Duration(seconds: timeoutSeconds));
       } else {
         final ioHttpClient = HttpClient()
-          // 如需严格校验证书，可以把下面这一行去掉。
           ..badCertificateCallback =
               (X509Certificate cert, String host, int port) => true;
-        // 与 curl/Python 一样，强制直连，不使用系统代理，避免某些环境下代理拦截。
         ioHttpClient.findProxy = (uri) => 'DIRECT';
         final ioClient = IOClient(ioHttpClient);
         resp = await ioClient
@@ -2318,8 +2974,24 @@ Future<dynamic> httpGetJson(
 
       lastError = 'HTTP ${resp.statusCode} ${resp.reasonPhrase}';
       debugPrint('[EMA][HTTP] Non-2xx $uri: $lastError');
-      if ([418, 429, 500, 502, 503, 504].contains(resp.statusCode)) {
-        final delay = Duration(milliseconds: 500 * attempt);
+      if (resp.statusCode == 418) {
+        final banMsg = _tryParseBinanceBanMessage(resp.body, resp.statusCode);
+        debugPrint('[EMA][HTTP] 418 response body: ${resp.body}');
+        throw Exception(
+          banMsg ?? 'Binance API 限流 (HTTP 418)，请稍后再试或减少扫描频率',
+        );
+      }
+      if ([429, 500, 502, 503, 504].contains(resp.statusCode)) {
+        if (resp.statusCode == 429) {
+          final banMsg = _tryParseBinanceBanMessage(resp.body, resp.statusCode);
+          if (banMsg != null) {
+            lastError = banMsg;
+          }
+        }
+        final baseMs = 500 * attempt;
+        final jitter = math.Random().nextInt(500);
+        final delay = Duration(milliseconds: baseMs + jitter);
+        debugPrint('[EMA][HTTP] retrying after ${delay.inMilliseconds}ms');
         await Future.delayed(delay);
         continue;
       } else {
@@ -2352,8 +3024,7 @@ int? parseSymbolOnboardTimestampMs(Map<String, dynamic> symbolInfo) {
 }
 
 Future<Map<String, int>> fetchUsdtPerpListingTimesMs() async {
-  final info =
-      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
+  final info = await fetchBinanceExchangeInfo() as dynamic;
   final listingTimes = <String, int>{};
   if (info is! Map<String, dynamic>) return listingTimes;
 
@@ -2385,11 +3056,9 @@ Future<List<ListingVolumeResult>> fetchSymbolsListedBetweenDates({
   required DateTime startDate,
   required DateTime endDate,
 }) async {
-  final exchangeInfo =
-      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
+  final exchangeInfo = await fetchBinanceExchangeInfo() as dynamic;
 
-  final ticker24h =
-      await httpGetJson('$binanceFapiBase/fapi/v1/ticker/24hr') as dynamic;
+  final ticker24h = await fetchBinanceTicker24hr() as dynamic;
 
   if (exchangeInfo is! Map<String, dynamic>) {
     return [];
@@ -2417,8 +3086,20 @@ Future<List<ListingVolumeResult>> fetchSymbolsListedBetweenDates({
 
   final results = <ListingVolumeResult>[];
 
-  final startMs = startDate.millisecondsSinceEpoch;
-  final endMs = endDate.millisecondsSinceEpoch;
+  final startMs = DateTime(
+    startDate.year,
+    startDate.month,
+    startDate.day,
+  ).millisecondsSinceEpoch;
+  final endMs = DateTime(
+    endDate.year,
+    endDate.month,
+    endDate.day,
+    23,
+    59,
+    59,
+    999,
+  ).millisecondsSinceEpoch;
 
   for (final s in symbols) {
     if (s is! Map<String, dynamic>) continue;
@@ -2454,8 +3135,7 @@ Future<List<ListingVolumeResult>> fetchSymbolsListedBetweenDates({
 }
 
 Future<Set<String>> fetchUsdtPerpetualSymbols() async {
-  final info =
-      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
+  final info = await fetchBinanceExchangeInfo() as dynamic;
 
   final symbols = <String>{};
   if (info is! Map<String, dynamic>) {
@@ -2486,24 +3166,35 @@ Future<Set<String>> fetchUsdtPerpetualSymbols() async {
 Future<List<String>> fetchTopSymbolsByQuoteVolume(
   int topN, {
   int? maxListingDays,
+  int? minListingDays,
 }) async {
   final usdtPerpSymbols = await fetchUsdtPerpetualSymbols();
   if (usdtPerpSymbols.isEmpty) {
     throw Exception('未能获取 USDT 永续合约列表');
   }
 
+  final useMaxFilter = maxListingDays != null && maxListingDays > 0;
+  final useMinFilter = minListingDays != null && minListingDays > 0;
+
   Map<String, int>? listingTimes;
-  int? listingCutoffMs;
-  if (maxListingDays != null && maxListingDays > 0) {
+  int? maxListingCutoffMs;
+  int? minListingCutoffMs;
+  if (useMaxFilter || useMinFilter) {
     listingTimes = await fetchUsdtPerpListingTimesMs();
-    listingCutoffMs = DateTime.now()
-        .toUtc()
-        .subtract(Duration(days: maxListingDays))
-        .millisecondsSinceEpoch;
+    final nowUtc = DateTime.now().toUtc();
+    if (useMaxFilter) {
+      maxListingCutoffMs = nowUtc
+          .subtract(Duration(days: maxListingDays))
+          .millisecondsSinceEpoch;
+    }
+    if (useMinFilter) {
+      minListingCutoffMs = nowUtc
+          .subtract(Duration(days: minListingDays))
+          .millisecondsSinceEpoch;
+    }
   }
 
-  final tickers =
-      await httpGetJson('$binanceFapiBase/fapi/v1/ticker/24hr') as dynamic;
+  final tickers = await fetchBinanceTicker24hr() as dynamic;
   if (tickers is! List) {
     throw Exception('返回数据格式异常：期望 list');
   }
@@ -2516,9 +3207,13 @@ Future<List<String>> fetchTopSymbolsByQuoteVolume(
       final symbol = (item['symbol'] ?? '').toString();
       if (!usdtPerpSymbols.contains(symbol)) continue;
 
-      if (listingCutoffMs != null) {
-        final listedAtMs = listingTimes?[symbol];
-        if (listedAtMs == null || listedAtMs < listingCutoffMs) {
+      if (listingTimes != null) {
+        final listedAtMs = listingTimes[symbol];
+        if (listedAtMs == null) continue;
+        if (maxListingCutoffMs != null && listedAtMs < maxListingCutoffMs) {
+          continue;
+        }
+        if (minListingCutoffMs != null && listedAtMs > minListingCutoffMs) {
           continue;
         }
       }
@@ -2545,8 +3240,7 @@ Future<List<_NewListingResult>> fetchNewlyListedSymbolsByLifetimeVolume({
   required int workers,
   void Function(int current, int total)? onProgress,
 }) async {
-  final info =
-      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
+  final info = await fetchBinanceExchangeInfo() as dynamic;
   if (info is! Map<String, dynamic>) return <_NewListingResult>[];
 
   final list = info['symbols'];
@@ -2558,8 +3252,7 @@ Future<List<_NewListingResult>> fetchNewlyListedSymbolsByLifetimeVolume({
       .millisecondsSinceEpoch;
 
   // 预取 24h 成交量数据，用于初筛排序。
-  final tickersRaw =
-      await httpGetJson('$binanceFapiBase/fapi/v1/ticker/24hr') as dynamic;
+  final tickersRaw = await fetchBinanceTicker24hr() as dynamic;
   final Map<String, double> vol24h = {};
   if (tickersRaw is List) {
     for (final t in tickersRaw) {
@@ -2667,6 +3360,81 @@ Future<List<_NewListingResult>> fetchNewlyListedSymbolsByLifetimeVolume({
 
   results.sort((a, b) => b.quoteVolume.compareTo(a.quoteVolume));
   return results.take(topN).toList();
+}
+
+class LifetimePriceRange {
+  final double minLow;
+  final double maxHigh;
+  final int barCount;
+
+  LifetimePriceRange({
+    required this.minLow,
+    required this.maxHigh,
+    required this.barCount,
+  });
+
+  double get rangeMultiple => minLow > 0 ? maxHigh / minLow : double.infinity;
+
+  bool isStable({double maxMultiple = stableMaxRangeMultiple}) {
+    return rangeMultiple < maxMultiple;
+  }
+}
+
+/// 用日线 K 线统计自上市以来的最低价与最高价（仅统计上市时间之后的 K 线）。
+Future<LifetimePriceRange?> fetchLifetimePriceRange(
+  String symbol,
+  int listingTimeMs,
+) async {
+  final listedAt = DateTime.fromMillisecondsSinceEpoch(
+    listingTimeMs,
+    isUtc: true,
+  );
+  final ageDays = DateTime.now().toUtc().difference(listedAt).inDays;
+  if (ageDays < 1) return null;
+
+  final klineLimit = math.min(ageDays + 1, binanceKlinesMaxLimit);
+  final klines =
+      await httpGetJson(
+            '$binanceFapiBase/fapi/v1/klines',
+            params: {
+              'symbol': symbol,
+              'interval': '1d',
+              'limit': '$klineLimit',
+            },
+          )
+          as dynamic;
+
+  if (klines is! List || klines.isEmpty) return null;
+
+  double? minLow;
+  double? maxHigh;
+  var barCount = 0;
+
+  for (final k in klines) {
+    try {
+      if (k is! List || k.length < 4) continue;
+      final openTimeMs = int.tryParse(k[0].toString());
+      if (openTimeMs == null || openTimeMs < listingTimeMs) continue;
+
+      final high = double.tryParse(k[2].toString());
+      final low = double.tryParse(k[3].toString());
+      if (high == null || low == null || low <= 0) continue;
+
+      minLow = minLow == null ? low : math.min(minLow, low);
+      maxHigh = maxHigh == null ? high : math.max(maxHigh, high);
+      barCount += 1;
+    } catch (_) {
+      continue;
+    }
+  }
+
+  if (minLow == null || maxHigh == null || barCount == 0) return null;
+
+  return LifetimePriceRange(
+    minLow: minLow,
+    maxHigh: maxHigh,
+    barCount: barCount,
+  );
 }
 
 Future<double> fetchFuturesLifetimeQuoteVolume(
@@ -2815,8 +3583,7 @@ Future<List<_NewListingResult>> fetchNewlyListedSymbols(
   int days,
   int topN,
 ) async {
-  final info =
-      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
+  final info = await fetchBinanceExchangeInfo() as dynamic;
   final results = <_NewListingResult>[];
   if (info is! Map<String, dynamic>) return results;
 
@@ -2829,8 +3596,7 @@ Future<List<_NewListingResult>> fetchNewlyListedSymbols(
       .millisecondsSinceEpoch;
 
   // 预取 24h 成交量数据，用于按成交量排序
-  final tickersRaw =
-      await httpGetJson('$binanceFapiBase/fapi/v1/ticker/24hr') as dynamic;
+  final tickersRaw = await fetchBinanceTicker24hr() as dynamic;
   final Map<String, double> volMap = {};
   if (tickersRaw is List) {
     for (final t in tickersRaw) {
@@ -3162,7 +3928,7 @@ _CrossVoteSummary resolveComprehensiveCrossDirectionInWindow({
   vote(detectFirstCrossInWindowNullable(ma20s, ma120s, windowStart, windowEnd));
   vote(detectFirstCrossInWindowNullable(ma60s, ma120s, windowStart, windowEnd));
 
-  if (upVotes + downVotes == 0 || upVotes == downVotes) {
+  if (upVotes == 0 || upVotes <= downVotes) {
     return _CrossVoteSummary(
       direction: null,
       upVotes: upVotes,
@@ -3171,7 +3937,7 @@ _CrossVoteSummary resolveComprehensiveCrossDirectionInWindow({
   }
 
   return _CrossVoteSummary(
-    direction: upVotes > downVotes ? 'up' : 'down',
+    direction: 'up',
     upVotes: upVotes,
     downVotes: downVotes,
   );
@@ -3397,26 +4163,22 @@ _PostDenseTrendDetection? evaluatePostDenseTrendSegment(
     length: trendEndIdx + 1,
   );
   final crossDirection = crossSummary.direction;
-  if (crossDirection == null) return null;
+  if (crossDirection != 'up') return null;
 
   final anchor = ctx.closes[denseEndIdx];
   final endClose = ctx.closes[trendEndIdx];
   if (anchor == 0) return null;
 
-  final netDirection = endClose > anchor
-      ? 'up'
-      : (endClose < anchor ? 'down' : null);
-  if (netDirection == null || netDirection != crossDirection) return null;
+  if (endClose <= anchor) return null;
 
-  final direction = crossDirection;
+  final direction = 'up';
   final netMovePct = (endClose - anchor) / anchor.abs() * 100.0;
-  if (netMovePct.abs() < threshold * 100.0 * 0.3) return null;
+  if (netMovePct < threshold * 100.0 * 0.3) return null;
 
   final ma20AtDense = ctx.ma20s[denseEndIdx];
   final ma20AtEnd = ctx.ma20s[trendEndIdx];
   if (ma20AtDense == null || ma20AtEnd == null) return null;
-  if (direction == 'up' && ma20AtEnd <= ma20AtDense) return null;
-  if (direction == 'down' && ma20AtEnd >= ma20AtDense) return null;
+  if (ma20AtEnd <= ma20AtDense) return null;
 
   var alongMa20Count = 0;
   var totalBars = 0;
@@ -3431,10 +4193,7 @@ _PostDenseTrendDetection? evaluatePostDenseTrendSegment(
     final prevClose = ctx.closes[i - 1];
     final prevMa120 = ctx.ma120s[i - 1];
     if (prevMa120 != null) {
-      if (direction == 'up' && prevClose >= prevMa120 && price < ma120) {
-        return null;
-      }
-      if (direction == 'down' && prevClose <= prevMa120 && price > ma120) {
+      if (prevClose >= prevMa120 && price < ma120) {
         return null;
       }
     }
@@ -3446,10 +4205,7 @@ _PostDenseTrendDetection? evaluatePostDenseTrendSegment(
     final signedDev = (price - ma20) / ma20Abs;
     devSum += signedDev.abs();
 
-    final alongMa20 = direction == 'up'
-        ? signedDev >= -threshold
-        : signedDev <= threshold;
-    if (alongMa20) alongMa20Count += 1;
+    if (signedDev >= -threshold) alongMa20Count += 1;
   }
 
   if (totalBars < 2) return null;
@@ -3576,14 +4332,14 @@ _PostDenseTrendDetection? evaluateBacktestDenseCluster(
     windowEnd: crossWindowEnd,
   );
   final direction = crossSummary.direction;
-  if (direction == null) return null;
+  if (direction != 'up') return null;
 
   var trendBarCount = 0;
   int? lastTrendBar;
   var devSum = 0.0;
 
   for (var i = clusterEnd + 1; i < ctx.closes.length; i++) {
-    if (!isAlongMa20AndEma20(ctx, i, direction, threshold)) {
+    if (!isAlongMa20AndEma20(ctx, i, 'up', threshold)) {
       break;
     }
     trendBarCount += 1;
@@ -3607,13 +4363,10 @@ _PostDenseTrendDetection? evaluateBacktestDenseCluster(
   if (anchor == 0) return null;
 
   final endClose = ctx.closes[lastTrendBar];
-  final netDirection = endClose > anchor
-      ? 'up'
-      : (endClose < anchor ? 'down' : null);
-  if (netDirection == null || netDirection != direction) return null;
+  if (endClose <= anchor) return null;
 
   return _PostDenseTrendDetection(
-    direction: direction,
+    direction: 'up',
     denseSpread: dense.spread,
     barsSinceDense: lastTrendBar - clusterEnd,
     netMovePct: (endClose - anchor) / anchor.abs() * 100.0,
@@ -3711,12 +4464,10 @@ class PostDenseTrendResult {
     );
   }
 
-  String get crossVoteLabel => direction == 'up'
-      ? '金叉 ${crossUpVotes}/${crossUpVotes + crossDownVotes}'
-      : '死叉 ${crossDownVotes}/${crossUpVotes + crossDownVotes}';
+  String get crossVoteLabel =>
+      '金叉 ${crossUpVotes}/${crossUpVotes + crossDownVotes}';
 
-  String get directionLabel =>
-      direction == 'up' ? '↑ 上涨($crossVoteLabel)' : '↓ 下跌($crossVoteLabel)';
+  String get directionLabel => '↑ 上涨($crossVoteLabel)';
 
   String get timeRangeLabel =>
       '${formatUtcDate(startTimeUtc)} ~ ${formatUtcDateTime(endTimeUtc)}';
@@ -3757,5 +4508,25 @@ class ListingVolumeResult {
     required this.symbol,
     required this.listingTime,
     required this.quoteVolume,
+  });
+}
+
+class StableSymbolResult {
+  final String symbol;
+  final DateTime listedAt;
+  final double minLow;
+  final double maxHigh;
+  final double rangeMultiple;
+  final double quoteVolume24h;
+  final int dailyBarsUsed;
+
+  StableSymbolResult({
+    required this.symbol,
+    required this.listedAt,
+    required this.minLow,
+    required this.maxHigh,
+    required this.rangeMultiple,
+    required this.quoteVolume24h,
+    required this.dailyBarsUsed,
   });
 }
