@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PerpScope Binance Browser
 // @namespace    perpscope
-// @version      0.4.0
-// @description  PerpScope 顺序浏览：每次新开 3 个标签，不覆盖已有标签页。
+// @version      0.6.0
+// @description  PerpScope 顺序浏览：同一批次任意窗口点下一组，打开的都是相同的下一批 3 个标签。
 // @match        https://www.binance.com/*
 // @match        https://binance.com/*
 // @match        https://*.binance.com/*
@@ -76,18 +76,36 @@
     return {
       symbols: queue.symbols.slice(),
       urls: queue.urls.slice(),
+      // currentIndex = 当前批次起点（不是某个具体页面币种下标）
       currentIndex: Math.max(0, Math.min(currentIndex, queue.urls.length - 1)),
       linkMode: queue.linkMode || 'futures',
       updatedAt: queue.updatedAt || new Date().toISOString(),
     };
   }
 
-  function getCurrentIndex(queue) {
+  /** 游标只用「批次起点」，同一批任意窗口 Next/Prev 结果一致。 */
+  function getBatchStart(queue) {
     const state = getState();
     if (state && typeof state.currentIndex === 'number') {
       return Math.max(0, Math.min(state.currentIndex, queue.urls.length - 1));
     }
     return queue.currentIndex;
+  }
+
+  function queueUrlWithBatch(url, queue, batchStart) {
+    const payload = {
+      symbols: queue.symbols,
+      urls: queue.urls,
+      currentIndex: batchStart,
+      linkMode: queue.linkMode,
+      updatedAt: new Date().toISOString(),
+    };
+    const base = String(url).split('#')[0];
+    return (
+      base +
+      '#perpscope_queue=' +
+      encodeURIComponent(JSON.stringify(payload))
+    );
   }
 
   function tryConsumeQueueFromUrlHash() {
@@ -105,12 +123,16 @@
     }
 
     GM_setValue(QUEUE_KEY, JSON.stringify(queue));
+    // 始终用 hash 里的批次起点，不要改成当前页面币种下标
     setState({
       currentIndex: queue.currentIndex,
       updatedAt: queue.updatedAt,
     });
     history.replaceState(null, '', location.pathname + location.search);
-    toast(`PerpScope 队列已注入（${queue.urls.length}）`);
+    const end = Math.min(queue.urls.length, queue.currentIndex + STEP);
+    toast(
+      `PerpScope 批次 ${queue.currentIndex + 1}-${end}/${queue.urls.length}`,
+    );
     return true;
   }
 
@@ -129,11 +151,25 @@
       updatedAt: new Date().toISOString(),
     });
 
+    // 同步回 localStorage，方便 PerpScope / 其他标签读到同一批次起点
+    try {
+      const synced = {
+        symbols: queue.symbols,
+        urls: queue.urls,
+        currentIndex: nextIndex,
+        linkMode: queue.linkMode,
+        updatedAt: new Date().toISOString(),
+      };
+      GM_setValue(QUEUE_KEY, JSON.stringify(synced));
+      localStorage.setItem(QUEUE_KEY, JSON.stringify(synced));
+    } catch (_) {}
+
     let opened = 0;
     for (let i = nextIndex; i < batchEnd; i += 1) {
       const name = tabName(i);
       if (window.name === name) continue;
-      window.open(queue.urls[i], name);
+      // 三个新窗口都带相同 batchStart
+      window.open(queueUrlWithBatch(queue.urls[i], queue, nextIndex), name);
       opened += 1;
     }
 
@@ -149,7 +185,7 @@
       toast('队列为空：先回 PerpScope 点“开始浏览”');
       return;
     }
-    openBatch(getCurrentIndex(queue) + delta);
+    openBatch(getBatchStart(queue) + delta);
   }
 
   function mountQuickButtons() {
@@ -251,7 +287,9 @@
 
     const queue = getQueue();
     if (queue) {
-      toast(`PerpScope 就绪，队列 ${queue.urls.length} 个`);
+      const start = getBatchStart(queue);
+      const end = Math.min(queue.urls.length, start + STEP);
+      toast(`PerpScope 批次 ${start + 1}-${end}/${queue.urls.length}`);
     } else {
       toast('PerpScope 脚本已加载，等待队列...');
     }

@@ -72,6 +72,12 @@ String formatVolume(double volume) {
 const MethodChannel _binanceChannel = MethodChannel('perpscope/binance');
 
 Future<void> _openSymbol(String symbol, String linkMode) async {
+  final seek = _EmaScannerPageState.onSymbolTap;
+  if (seek != null) {
+    await seek(symbol);
+    return;
+  }
+
   if (!kIsWeb && Platform.isAndroid) {
     try {
       final handled = await _binanceChannel.invokeMethod<bool>('openBinance', {
@@ -146,6 +152,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   static bool _spotFetching = false;
   static Map<String, _AlphaTokenInfo>? _alphaTokens;
   static bool _alphaFetching = false;
+  /// 点击结果里的币种链接时，把浏览游标定位到该币并打开后续批次。
+  static Future<void> Function(String symbol)? onSymbolTap;
 
   DateTime? listingStartDate;
   DateTime? listingEndDate;
@@ -286,10 +294,14 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     _initNotifications();
     _ensureSpotSymbols();
     _ensureAlphaTokens();
+    onSymbolTap = _openSymbolAndSeekBrowse;
   }
 
   @override
   void dispose() {
+    if (identical(onSymbolTap, _openSymbolAndSeekBrowse)) {
+      onSymbolTap = null;
+    }
     _topNController.dispose();
     _thresholdController.dispose();
     _klinesLimitController.dispose();
@@ -459,7 +471,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     for (var i = index; i < batchEnd; i++) {
       final itemSymbol = _browseSymbols[i];
       var url = binanceFuturesUrl(itemSymbol);
-      if (payload != null && i == index) {
+      // 同一批次三个窗口都带相同 batchStart，避免各自按页面币种算出不同的「下一组」。
+      if (payload != null) {
         url = '$url#perpscope_queue=$payload';
       }
       await openBinanceViewerUrl(
@@ -469,18 +482,69 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     }
   }
 
-  Future<void> _startBrowseCurrentResults() async {
-    final symbols = _buildBrowseSymbolsFromCurrentResults();
-    await _startBrowseWithSymbols(symbols);
-  }
-
-  Future<void> _startBrowseWithSymbols(Iterable<String> symbols) async {
+  List<String> _dedupeSymbols(Iterable<String> symbols) {
     final uniqueSymbols = <String>[];
     final seen = <String>{};
     for (final symbol in symbols) {
       if (symbol.isEmpty || !seen.add(symbol)) continue;
       uniqueSymbols.add(symbol);
     }
+    return uniqueSymbols;
+  }
+
+  int _resolveBrowseStartIndex(List<String> symbols, {String? preferSymbol}) {
+    if (symbols.isEmpty) return 0;
+    if (preferSymbol != null) {
+      final byPrefer = symbols.indexOf(preferSymbol);
+      if (byPrefer >= 0) return byPrefer;
+    }
+    if (_browseIndex >= 0 && _browseIndex < _browseSymbols.length) {
+      final current = _browseSymbols[_browseIndex];
+      final byCurrent = symbols.indexOf(current);
+      if (byCurrent >= 0) return byCurrent;
+    }
+    if (_browseIndex >= 0 && _browseIndex < symbols.length) {
+      return _browseIndex;
+    }
+    return 0;
+  }
+
+  /// 点击某个币种链接：以该币为起点打开当前批次（3个），之后「下一个」从这里继续。
+  Future<void> _openSymbolAndSeekBrowse(String symbol) async {
+    if (symbol.isEmpty) return;
+
+    var queue = _browseSymbols;
+    if (queue.isEmpty || !queue.contains(symbol)) {
+      queue = _dedupeSymbols(_buildBrowseSymbolsFromCurrentResults());
+    }
+    if (queue.isEmpty) {
+      queue = [symbol];
+    } else if (!queue.contains(symbol)) {
+      // 不在当前结果队列里：仍打开该币，并把它插到游标后以便后续继续。
+      final insertAt = (_browseIndex + 1).clamp(0, queue.length);
+      queue = [...queue]..insert(insertAt, symbol);
+    }
+
+    final index = queue.indexOf(symbol);
+    setState(() {
+      _browseSymbols = queue;
+      _browseIndex = index;
+    });
+    _publishBrowseQueue();
+    await _openBrowseIndex(index);
+  }
+
+  Future<void> _startBrowseCurrentResults() async {
+    final symbols = _buildBrowseSymbolsFromCurrentResults();
+    await _startBrowseWithSymbols(symbols);
+  }
+
+  Future<void> _startBrowseWithSymbols(
+    Iterable<String> symbols, {
+    String? preferSymbol,
+    bool forceFromStart = false,
+  }) async {
+    final uniqueSymbols = _dedupeSymbols(symbols);
     if (uniqueSymbols.isEmpty) {
       setState(() {
         _status = '没有可浏览的结果';
@@ -488,12 +552,16 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       return;
     }
 
+    final startIndex = forceFromStart
+        ? 0
+        : _resolveBrowseStartIndex(uniqueSymbols, preferSymbol: preferSymbol);
+
     setState(() {
       _browseSymbols = uniqueSymbols;
-      _browseIndex = 0;
+      _browseIndex = startIndex;
     });
     _publishBrowseQueue();
-    await _openBrowseIndex(0);
+    await _openBrowseIndex(startIndex);
   }
 
   Future<void> _browsePrev() async {
@@ -592,7 +660,10 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           actions: [
             TextButton(
               onPressed: () async {
-                await _startBrowseWithSymbols(matches.map((m) => m.symbol));
+                await _startBrowseWithSymbols(
+                  matches.map((m) => m.symbol),
+                  forceFromStart: true,
+                );
               },
               child: const Text('开始顺序浏览'),
             ),
@@ -848,7 +919,10 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           actions: [
             TextButton(
               onPressed: () async {
-                await _startBrowseWithSymbols(results.map((r) => r.symbol));
+                await _startBrowseWithSymbols(
+                  results.map((r) => r.symbol),
+                  forceFromStart: true,
+                );
               },
               child: const Text('开始顺序浏览'),
             ),
@@ -898,7 +972,10 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           actions: [
             TextButton(
               onPressed: () async {
-                await _startBrowseWithSymbols(results.map((r) => r.symbol));
+                await _startBrowseWithSymbols(
+                  results.map((r) => r.symbol),
+                  forceFromStart: true,
+                );
               },
               child: const Text('开始顺序浏览'),
             ),
@@ -1313,7 +1390,10 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           actions: [
             TextButton(
               onPressed: () async {
-                await _startBrowseWithSymbols(results.map((m) => m.symbol));
+                await _startBrowseWithSymbols(
+                  results.map((m) => m.symbol),
+                  forceFromStart: true,
+                );
               },
               child: const Text('开始顺序浏览'),
             ),
@@ -1421,7 +1501,10 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           actions: [
             TextButton(
               onPressed: () async {
-                await _startBrowseWithSymbols(results.map((m) => m.symbol));
+                await _startBrowseWithSymbols(
+                  results.map((m) => m.symbol),
+                  forceFromStart: true,
+                );
               },
               child: const Text('开始顺序浏览'),
             ),
@@ -1472,7 +1555,10 @@ class _EmaScannerPageState extends State<EmaScannerPage>
           actions: [
             TextButton(
               onPressed: () async {
-                await _startBrowseWithSymbols(results.map((r) => r.symbol));
+                await _startBrowseWithSymbols(
+                  results.map((r) => r.symbol),
+                  forceFromStart: true,
+                );
               },
               child: const Text('开始顺序浏览'),
             ),
@@ -2646,7 +2732,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                           ),
                           const SizedBox(width: 8),
                           const Text(
-                            '需安装 Tampermonkey；快捷键每次跳 3 个: [ ] / ← → / J K',
+                            '点币种链接可定位；下一个(+3)从当前位置继续',
                             style: TextStyle(fontSize: 12, color: Colors.grey),
                           ),
                         ],
